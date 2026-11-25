@@ -74,6 +74,12 @@ Uninstall:
 - `linux_updater.mjs`: resumable HTTP/1.1 Keep-Alive downloader (`Range: bytes=...`) with SHA-512 verification and atomic `app/` swap via `apply_update.py`.
 - `patch_notifications_en.mjs`: sets default locale fallback to `en` and translates remaining hardcoded Chinese UI/toast/dialog strings when running in English.
 
+## Hardware Support
+
+- **Hardware-verified**: AULA WIN 68 HE (`2e3c:c365`) on Arch Linux (Hyprland/Wayland).
+- **Experimental (untested on hardware)**: `udev/99-aula-hub.rules` includes WebHID rules for all 79 keyboard, mouse, and wireless dongle `VID:PID` pairs listed in AULA HUB (`WIN HE`, `HERO HE`, `MINI HE`, `AG60`/`AG63`/`AG75`, `F75`/`F87`/`F108`, `V9`/`X9`, etc.).
+- **Unsupported**: Headsets (`HeadsetService.exe`).
+
 ## Known Limitations
 
 - Windows-only features are stubbed or non-functional on Linux: GameSense (`GsiManager`), `HeadsetService.exe`, `pnputil`, OS auto-start (`setLoginItemSettings`), and active-window `.exe` switching (`autoChangeConfig`).

@@ -260,5 +260,21 @@ test ! -L "$FAKE_HOME/.local/bin/aula-hub"
 test ! -f "$FAKE_HOME/.local/share/applications/aula-hub.desktop"
 echo "install.sh & uninstall.sh OK"
 
+echo "=== 6. udev Rules Validation ==="
+RULES_FILE="$ROOT_DIR/udev/99-aula-hub.rules"
+test -f "$RULES_FILE"
+grep -q 'idVendor}=="2e3c".*idProduct}=="c365"' "$RULES_FILE"
+# Shared VIDs (0c45, 1a86) must never appear without an idProduct filter
+if grep -E 'idVendor}=="(0c45|1a86)"' "$RULES_FILE" | grep -vq 'idProduct}=="'; then
+  echo "FAIL: Shared VID (0c45/1a86) found without idProduct filter" >&2
+  exit 1
+fi
+HIDRAW_COUNT="$(grep -c '^KERNEL=="hidraw\*"' "$RULES_FILE")"
+if [[ "$HIDRAW_COUNT" -lt 79 ]]; then
+  echo "FAIL: Expected at least 79 hidraw rules, found $HIDRAW_COUNT" >&2
+  exit 1
+fi
+echo "udev rules OK ($HIDRAW_COUNT hidraw rules)"
+
 echo ""
 echo "ALL TESTS PASSED!"
