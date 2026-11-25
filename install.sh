@@ -94,7 +94,7 @@ check_deps() {
   if [[ ${#missing[@]} -gt 0 ]]; then
     echo "Missing required tools: ${missing[*]}" >&2
     echo "Install hints:" >&2
-    echo "  Arch Linux:   sudo pacman -S python p7zip nodejs curl electron" >&2
+    echo "  Arch Linux:   sudo pacman -S python p7zip nodejs curl electron41" >&2
     echo "  Debian/Ubuntu: sudo apt install python3 p7zip-full nodejs curl" >&2
     echo "  Fedora:       sudo dnf install python3 p7zip p7zip-plugins nodejs curl" >&2
     exit 1
@@ -105,7 +105,7 @@ check_deps() {
       echo "Warning: Electron binary not found; install Electron before running aula-hub." >&2
     else
       echo "Missing required Electron runtime (tried electron41..electron36, electron)." >&2
-      echo "Install system Electron (e.g. 'sudo pacman -S electron' on Arch) or set AULA_HUB_ELECTRON." >&2
+      echo "Install system Electron 41 (e.g. 'sudo pacman -S electron41' on Arch) or set AULA_HUB_ELECTRON." >&2
       exit 1
     fi
   fi

@@ -22,7 +22,7 @@ find_electron() {
 ELECTRON_BIN="$(find_electron || true)"
 if [[ -z "$ELECTRON_BIN" ]]; then
   echo "Error: Electron runtime not found (tried electron41..electron36, electron)." >&2
-  echo "Install system Electron (e.g. 'sudo pacman -S electron' on Arch) or set AULA_HUB_ELECTRON." >&2
+  echo "Install system Electron 41 (e.g. 'sudo pacman -S electron41' on Arch) or set AULA_HUB_ELECTRON." >&2
   exit 1
 fi
 

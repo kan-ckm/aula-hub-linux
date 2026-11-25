@@ -10,12 +10,12 @@ No proprietary AULA binaries (`app.asar`, `.exe`) are included in this repositor
 - `7z` (`p7zip` / `p7zip-full`)
 - `nodejs`
 - `curl`
-- System `electron` (`electron41`..`electron36` or `electron` in `PATH`, or set `AULA_HUB_ELECTRON`)
+- System `electron41` (AULA HUB v2.9.0 ships V8 bytecode compiled for Electron 41; other major versions fail with `V8 mismatch`; override via `AULA_HUB_ELECTRON`)
 
 Arch Linux:
 
 ```bash
-sudo pacman -S electron python p7zip nodejs curl
+sudo pacman -S electron41 python p7zip nodejs curl
 ```
 
 ## Install
@@ -45,10 +45,10 @@ Run with `aula-hub` (requires `~/.local/bin` in `PATH`) or via the desktop entry
 
 ## udev Rules
 
-For non-root WebHID access, `install.sh` installs `udev/99-aula-hub.rules` to `/etc/udev/rules.d/99-aula-hub.rules`. Manual setup:
+For non-root WebHID access, `install.sh` installs `udev/99-aula-hub.rules` to `/etc/udev/rules.d/99-aula-hub.rules`. Remote piped installs (`curl ... | bash`) run non-interactively and skip `sudo`; apply manually and replug your device:
 
 ```bash
-sudo install -Dm644 udev/99-aula-hub.rules /etc/udev/rules.d/99-aula-hub.rules
+sudo install -Dm644 ~/.local/share/aula-hub-linux/udev/99-aula-hub.rules /etc/udev/rules.d/99-aula-hub.rules
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 

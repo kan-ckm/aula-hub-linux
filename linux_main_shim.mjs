@@ -204,6 +204,11 @@ export async function installLinuxMainShim() {
   if (shimInstalled || process.platform !== "linux") return;
   shimInstalled = true;
 
+  // Make the main process easily identifiable as "aula-hub" in btop/htop/ps
+  try {
+    process.title = "aula-hub";
+  } catch {}
+
   const {
     app,
     BrowserWindow,
