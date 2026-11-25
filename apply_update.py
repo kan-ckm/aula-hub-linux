@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -21,8 +23,22 @@ import zipfile
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent
-UPDATE_BASE_URL = "https://toolsuse.aulacn.com/zip-use/ClientBase/"
+HUB_API_BASE = os.environ.get("AULA_HUB_API_BASE", "https://hubapi.aulacn.com").rstrip("/")
+NEW_VERSION_API_URL = os.environ.get(
+    "AULA_UPDATE_API_URL", f"{HUB_API_BASE}/user/Client/getNewVersion"
+)
+UPDATE_BASE_URL = (
+    os.environ.get(
+        "AULA_UPDATE_BASE_URL", "https://toolsuse.aulacn.com/zip-use/ClientBase/"
+    ).rstrip("/")
+    + "/"
+)
 LATEST_YML_URL = f"{UPDATE_BASE_URL}latest.yml"
+DEFAULT_PARALLEL_WORKERS = max(
+    1, min(12, int(os.environ.get("AULA_DOWNLOAD_WORKERS", "6") or "6"))
+)
+DEFAULT_CHUNK_BYTES = 4 * 1024 * 1024
+SINGLE_STREAM_ONLY_HOSTS = {"toolsuse.aulacn.com"}
 
 
 def find_node() -> str:
@@ -65,39 +81,104 @@ def parse_latest_yml(text: str) -> dict[str, str]:
     return info
 
 
-def fetch_latest_info() -> dict[str, str]:
+def normalize_download_url(raw_url: str, base_url: str = "") -> str:
+    url = raw_url.strip()
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        if base_url:
+            url = urllib.parse.urljoin(base_url, url.lstrip("/"))
+        else:
+            url = f"{HUB_API_BASE}/files/{url.lstrip('/')}"
+    parsed = urllib.parse.urlsplit(url)
+    quoted_path = urllib.parse.quote(parsed.path, safe="/%")
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, quoted_path, parsed.query, parsed.fragment)
+    )
+
+
+def parse_hub_version_json(text: str) -> dict[str, str]:
+    payload = json.loads(text)
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        data = payload if isinstance(payload, dict) else {}
+    version = str(data.get("version") or "").strip()
+    raw_url = str(data.get("url") or "").strip()
+    if not version or not raw_url:
+        raise RuntimeError("Invalid getNewVersion response from AULA API")
+    url = normalize_download_url(raw_url)
+    info: dict[str, str] = {
+        "version": version,
+        "url": url,
+        "path": urllib.parse.unquote(Path(urllib.parse.urlsplit(url).path).name),
+        "source": "hubapi",
+    }
+    if data.get("sha256"):
+        info["sha256"] = str(data["sha256"]).strip().lower()
+    if data.get("size"):
+        info["size"] = str(data["size"]).strip()
+    if data.get("hotUpdateUrl"):
+        info["hotUpdateUrl"] = normalize_download_url(str(data["hotUpdateUrl"]))
+    if data.get("hotUpdateSha256"):
+        info["hotUpdateSha256"] = str(data["hotUpdateSha256"]).strip().lower()
+    return info
+
+
+def _fetch_text(url: str, timeout_s: int = 20) -> str:
     if shutil.which("curl"):
-        res = subprocess.run(
-            [
-                "curl",
-                "-4",
-                "--http1.1",
-                "-fsSL",
-                "--retry",
-                "3",
-                "--retry-delay",
-                "2",
-                "--retry-all-errors",
-                "--connect-timeout",
-                "15",
-                "--max-time",
-                "30",
-                "-A",
-                "electron-updater",
-                LATEST_YML_URL,
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        text = res.stdout
-    else:
-        req = urllib.request.Request(LATEST_YML_URL, headers={"User-Agent": "electron-updater"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            text = resp.read().decode("utf-8", errors="replace")
+        last_err: Exception | None = None
+        for attempt in range(4):
+            try:
+                res = subprocess.run(
+                    [
+                        "curl",
+                        "-4",
+                        "--http1.1",
+                        "-fsSL",
+                        "--connect-timeout",
+                        "10",
+                        "--max-time",
+                        str(timeout_s),
+                        "-A",
+                        "electron-updater",
+                        url,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                return res.stdout
+            except subprocess.CalledProcessError as exc:
+                last_err = exc
+                if attempt < 3:
+                    time.sleep(0.5 * (attempt + 1))
+        assert last_err is not None
+        raise last_err
+    req = urllib.request.Request(url, headers={"User-Agent": "electron-updater"})
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def fetch_latest_info() -> dict[str, str]:
+    use_legacy_only = bool(
+        os.environ.get("AULA_UPDATE_BASE_URL")
+        and not os.environ.get("AULA_UPDATE_API_URL")
+        and not os.environ.get("AULA_HUB_API_BASE")
+    )
+    if not use_legacy_only:
+        try:
+            text = _fetch_text(NEW_VERSION_API_URL, timeout_s=20)
+            return parse_hub_version_json(text)
+        except Exception as exc:
+            print(
+                f"Note: primary AULA API unavailable ({exc}); falling back to legacy latest.yml",
+                file=sys.stderr,
+            )
+
+    text = _fetch_text(LATEST_YML_URL, timeout_s=30)
     info = parse_latest_yml(text)
     if not info.get("version") or not info.get("path"):
         raise RuntimeError("Invalid latest.yml response from AULA server")
+    info["url"] = urllib.parse.urljoin(UPDATE_BASE_URL, urllib.parse.quote(info["path"]))
+    info["source"] = "legacy"
     return info
 
 
@@ -163,10 +244,16 @@ def copy_tree_contents(src: Path, dst: Path) -> int:
     return copied
 
 
-def ensure_linux_sharp(app_new: Path, existing_app: Path) -> None:
+def ensure_linux_sharp(
+    app_new: Path, existing_app: Path, install_sharp: bool = False
+) -> None:
     win_sharp = app_new / "node_modules" / "@img" / "sharp-win32-x64"
     if win_sharp.exists():
         shutil.rmtree(win_sharp)
+
+    if not install_sharp and os.environ.get("AULA_INSTALL_SHARP", "") != "1":
+        # Linux iconWorker reads image files directly without sharp; skip npm install to speed up setup.
+        return
 
     sharp_pkg_json = app_new / "node_modules" / "sharp" / "package.json"
     if not sharp_pkg_json.is_file():
@@ -216,260 +303,222 @@ def ensure_linux_sharp(app_new: Path, existing_app: Path) -> None:
     print(f"Installed fresh sharp-linux-x64@{sharp_ver} and sharp-libvips-linux-x64@{vips_ver}")
 
 
+LINUX_ICON_WORKER_SHIM = '''import fs from "node:fs";
+import path from "node:path";
+
+if (process.platform === "win32") {
+  await import("./iconWorker.orig.mjs");
+} else {
+  const MIME_BY_EXT = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+    ".bmp": "image/bmp",
+  };
+
+  setImmediate(() => {
+    process.parentPort?.postMessage({ type: "worker-ready" });
+  });
+
+  process.parentPort?.on("message", ({ data }) => {
+    if (!data || typeof data !== "object") return;
+    const { type, id } = data;
+    if (type === "run-ps") {
+      process.parentPort?.postMessage({
+        type: "ps-result",
+        id,
+        stdout: "",
+        error: "PowerShell unavailable on Linux",
+      });
+      return;
+    }
+    if (type === "extract-icon") {
+      try {
+        const filePath = data.filePath;
+        if (!filePath || !fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+          process.parentPort?.postMessage({ type: "icon-result", id, dataUrl: "" });
+          return;
+        }
+        const ext = path.extname(filePath).toLowerCase();
+        const mime = MIME_BY_EXT[ext];
+        if (!mime) {
+          process.parentPort?.postMessage({ type: "icon-result", id, dataUrl: "" });
+          return;
+        }
+        const buf = fs.readFileSync(filePath);
+        process.parentPort?.postMessage({
+          type: "icon-result",
+          id,
+          dataUrl: `data:${mime};base64,${buf.toString("base64")}`,
+        });
+      } catch {
+        process.parentPort?.postMessage({ type: "icon-result", id, dataUrl: "" });
+      }
+    }
+  });
+}
+'''
+
+LINUX_MAIN_WRAPPER = '''import { installLinuxMainShim } from "../../linux_main_shim.mjs";
+await installLinuxMainShim();
+await import("./main.orig.mjs");
+'''
+
+LINUX_MAIN_CJS_WRAPPER = """'use strict';
+const path = require('node:path');
+const { pathToFileURL } = require('node:url');
+
+(async () => {
+  const shimUrl = pathToFileURL(path.resolve(__dirname, '../../linux_main_shim.mjs')).href;
+  const { installLinuxMainShim } = await import(shimUrl);
+  await installLinuxMainShim();
+  require('./main.orig.cjs');
+})().catch((err) => {
+  console.error('[aula-hub-linux] Fatal startup error:', err);
+  process.exit(1);
+});
+"""
+
+
 def patch_icon_worker(app_new: Path) -> Path:
     worker_path = app_new / "dist-electron" / "iconWorker.mjs"
-    txt = worker_path.read_text(encoding="utf-8")
-
-    # 1. Guard Windows IconExtractor spawn loop
-    txt, n1 = re.subn(
-        r'(function\s+\w+\s*\(\s*\)\s*\{\s*(?:var\s+\w+;\s*)?)(\w+\s*\|\|\s*\w+\s*&&\s*\(\w+\s*=\s*\w+\(\w+\))',
-        r'\1if (process.platform !== "win32") return;\n  \2',
-        txt,
-        count=1,
-    )
-    if n1 != 1:
-        raise RuntimeError("Failed to patch iconWorker spawn guard")
-
-    # 2. Guard run-ps handler (looks for aula_ps_)
-    txt, n2 = re.subn(
-        r'(async function\s+\w+\s*\(\s*(\w+)\s*,\s*\w+\s*\)\s*\{\s*)(const\s+\w+\s*=\s*[^\n]*aula_ps_)',
-        r'\1if (process.platform !== "win32") {\n    process.parentPort.postMessage({ type: "ps-result", id: \2, stdout: "", error: "PowerShell unavailable on Linux" });\n    return;\n  }\n  \3',
-        txt,
-        count=1,
-    )
-    if n2 != 1:
-        raise RuntimeError("Failed to patch iconWorker run-ps guard")
-
-    # 3. Direct base64 encoding for Linux icon files inside extract-icon handler
-    m = re.search(
-        r'async function\s+\w+\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*\{\s*try\s*\{\s*(const\s+\w+\s*=\s*await\s+\w+\(\2\);)',
-        txt,
-    )
-    if not m:
-        raise RuntimeError("Failed to locate extract-icon handler in iconWorker.mjs")
-    id_var, path_var, call_stmt = m.group(1), m.group(2), m.group(3)
-    # Find fs & path imports in iconWorker.mjs
-    m_fs = re.search(r'import\s+(\w+)\s+from\s+"fs"', txt)
-    m_path = re.search(r'import\s+(\w+)\s+from\s+"path"', txt)
-    if not m_fs or not m_path:
-        raise RuntimeError("Missing fs/path import in iconWorker.mjs")
-    fs_var, p_var = m_fs.group(1), m_path.group(1)
-
-    linux_icon_block = (
-        f'if (process.platform !== "win32") {{\n'
-        f'      if (!{path_var} || !{fs_var}.existsSync({path_var}) || !{fs_var}.statSync({path_var}).isFile()) {{\n'
-        f'        process.parentPort.postMessage({{ type: "icon-result", id: {id_var}, dataUrl: "" }});\n'
-        f'        return;\n'
-        f'      }}\n'
-        f'      const _ext = {p_var}.extname({path_var}).toLowerCase();\n'
-        f'      const _mime = {{ ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".svg": "image/svg+xml", ".ico": "image/x-icon", ".bmp": "image/bmp" }}[_ext];\n'
-        f'      if (!_mime) {{\n'
-        f'        process.parentPort.postMessage({{ type: "icon-result", id: {id_var}, dataUrl: "" }});\n'
-        f'        return;\n'
-        f'      }}\n'
-        f'      const _buf = {fs_var}.readFileSync({path_var});\n'
-        f'      process.parentPort.postMessage({{ type: "icon-result", id: {id_var}, dataUrl: `data:${{_mime}};base64,${{_buf.toString("base64")}}` }});\n'
-        f'      return;\n'
-        f'    }}\n    {call_stmt}'
-    )
-    txt = txt[: m.start(3)] + linux_icon_block + txt[m.end(3) :]
-    worker_path.write_text(txt, encoding="utf-8")
+    if not worker_path.is_file():
+        raise RuntimeError(f"Missing {worker_path}")
+    orig_path = app_new / "dist-electron" / "iconWorker.orig.mjs"
+    if not orig_path.exists():
+        worker_path.rename(orig_path)
+    worker_path.write_text(LINUX_ICON_WORKER_SHIM, encoding="utf-8")
     return worker_path
 
 
-def patch_main_mjs(app_new: Path) -> Path:
-    main_path = app_new / "dist-electron" / "main.mjs"
-    txt = main_path.read_text(encoding="utf-8")
+def patch_bytecode_loader(app_new: Path) -> Path | None:
+    loader_path = app_new / "dist-electron" / "bytecode-loader.cjs"
+    if not loader_path.is_file():
+        return None
+    txt = loader_path.read_text(encoding="utf-8")
+    if "FLAG_HASH_OFFSET + 8" in txt:
+        return loader_path
 
-    # 1. Inspect electron import and add net as _lnNet + registerLinuxUpdater import
-    m_imp = re.search(r'(import\s+[^;]*\{([^}]*)\}\s*from\s*"electron";)', txt)
-    if not m_imp:
-        raise RuntimeError("Could not find electron import in main.mjs")
-    full_imp, named = m_imp.group(1), m_imp.group(2)
+    pat = re.compile(
+        r"Buffer\.from\((dummyBytecode)\)\.copy\(\s*(bytecodeBuffer)\s*,\s*(FLAG_HASH_OFFSET)\s*,\s*\3\s*,\s*\3\s*\+\s*4\s*\)"
+    )
 
-    m_app = re.search(r'\bapp\s+as\s+(\w+)', named)
-    m_ipc = re.search(r'\bipcMain\s+as\s+(\w+)', named)
-    if not m_app or not m_ipc:
-        raise RuntimeError("Could not resolve app/ipcMain aliases in main.mjs")
-    app_var, ipc_var = m_app.group(1), m_ipc.group(1)
+    def repl(m: re.Match[str]) -> str:
+        dummy_var, buf_var, off_var = m.group(1), m.group(2), m.group(3)
+        return (
+            f'if ({buf_var}.readUInt32LE(4) !== {dummy_var}.readUInt32LE(4)) {{\n'
+            f'    throw new Error(`[bytecode] V8 mismatch: expected hash 0x${{{buf_var}.readUInt32LE(4).toString(16)}}, got 0x${{{dummy_var}.readUInt32LE(4).toString(16)}} (Electron ${{process.versions.electron || "unknown"}}; install electron41)`);\n'
+            f'  }}\n'
+            f'  Buffer.from({dummy_var}).copy({buf_var}, {off_var}, {off_var}, {off_var} + 8)'
+        )
 
-    m_net = re.search(r'\bnet\s+as\s+(\w+)', named)
-    if m_net:
-        net_var = m_net.group(1)
-        new_imp = full_imp
-    elif re.search(r'\bnet\b', named):
-        net_var = "net"
-        new_imp = full_imp
-    else:
-        net_var = "_lnNet"
-        new_imp = full_imp.replace("} from \"electron\";", f", net as {net_var} }} from \"electron\";")
+    new_txt, n = pat.subn(repl, txt, count=1)
+    if n != 1:
+        raise RuntimeError(f"Failed to patch V8 header copy in {loader_path}")
+    loader_path.write_text(new_txt, encoding="utf-8")
+    return loader_path
 
-    new_imp += '\nimport { registerLinuxUpdater as _registerLinuxUpdater } from "../../linux_updater.mjs";'
-    txt = txt.replace(full_imp, new_imp, 1)
 
-    # 2. Guard HeadsetService.exe launcher on non-win32
-    txt, n_hs = re.subn(
-        r'(function\s+\w+\s*\(\s*\)\s*\{\s*(?:var\s+[^;]+;\s*)?)(if\s*\([^)]+\)\s*return\s+console\.log\("\[headsetManager\])',
-        r'\1if (process.platform !== "win32")\n    return !1;\n  \2',
-        txt,
-        count=1,
-    )
-    if n_hs != 1:
-        raise RuntimeError("Failed to patch HeadsetService guard in main.mjs")
+def patch_main_mjs(app_new: Path) -> list[Path]:
+    dist_electron = app_new / "dist-electron"
+    main_cjs = dist_electron / "main.cjs"
+    main_mjs = dist_electron / "main.mjs"
 
-    # 3. Wrap app.setLoginItemSettings(...) safely
-    login_pat = re.compile(rf'{re.escape(app_var)}\.setLoginItemSettings\(\{{[\s\S]{{0,180}}?\n\s*\}}\)')
-    txt, n_login = login_pat.subn(
-        lambda m: f'(() => {{ try {{ {m.group(0)}; }} catch {{}} }})()',
-        txt,
-    )
-    if n_login < 1:
-        raise RuntimeError("Failed to wrap setLoginItemSettings in main.mjs")
+    if main_cjs.is_file():
+        orig_cjs = dist_electron / "main.orig.cjs"
+        if not orig_cjs.exists():
+            main_cjs.rename(orig_cjs)
+        main_cjs.write_text(LINUX_MAIN_CJS_WRAPPER, encoding="utf-8")
+        out: list[Path] = [main_cjs]
+        loader_path = patch_bytecode_loader(app_new)
+        if loader_path is not None:
+            out.append(loader_path)
+        return out
 
-    # 4. Add select-hid-device handler right after setDevicePermissionHandler(...)
-    m_dev = re.search(
-        r'((\w+)\.webContents\.session\.setDevicePermissionHandler\([\s\S]{0,240}?aula://"\)\))(?=[,;])',
-        txt,
-    )
-    if not m_dev:
-        raise RuntimeError("Failed to locate setDevicePermissionHandler in main.mjs")
-    dev_call, win_var = m_dev.group(1), m_dev.group(2)
-    hid_hook = (
-        f'{dev_call}, {win_var}.webContents.session.listenerCount("select-hid-device") || '
-        f'{win_var}.webContents.session.on("select-hid-device", (_ev, _det, _cb) => {{\n'
-        f'  _ev.preventDefault();\n'
-        f'  const _list = _det.deviceList || [];\n'
-        f'  const _pref = _list.find((_item) => Array.isArray(_item.collections) && _item.collections.some((_c) => _c.usagePage >= 65280)) || _list[0];\n'
-        f'  _cb(_pref ? _pref.deviceId : "");\n'
-        f'}})'
-    )
-    txt = txt[: m_dev.start(1)] + hid_hook + txt[m_dev.end(1) :]
+    if main_mjs.is_file():
+        orig_mjs = dist_electron / "main.orig.mjs"
+        if not orig_mjs.exists():
+            main_mjs.rename(orig_mjs)
+        main_mjs.write_text(LINUX_MAIN_WRAPPER, encoding="utf-8")
+        return [main_mjs]
 
-    # 5. Harden http-bridge retry + Electron net.fetch with 30s min timeout
-    m_retry = re.search(
-        r'const\s+([$\w]+)\s*=\s*\([$\w]+\s*=\s*([$\w]+)\s*==\s*null\s*\?\s*void\s*0\s*:\s*\2\.cause\)\s*==\s*null\s*\?\s*void\s*0\s*:\s*[$\w]+\.code;\s*'
-        r'if\s*\(!([$\w]+)\.includes\(\1\)\s*\|\|\s*([$\w]+)\s*===\s*([$\w]+)\s*-\s*1\)\s*throw\s+\2;',
-        txt,
-    )
-    if not m_retry:
-        raise RuntimeError("Failed to locate http-bridge retry guard in main.mjs")
-    code_var, err_var, list_var, idx_var, max_var = (
-        m_retry.group(1),
-        m_retry.group(2),
-        m_retry.group(3),
-        m_retry.group(4),
-        m_retry.group(5),
-    )
-    retry_repl = (
-        f'{m_retry.group(0).split("if")[0]}'
-        f'const _isTimeout = String(({err_var} == null ? void 0 : {err_var}.message) || "").includes("timeout");\n'
-        f'          if ((!{list_var}.includes({code_var}) && !_isTimeout) || {idx_var} === {max_var} - 1)\n'
-        f'            throw {err_var};'
-    )
-    txt = txt[: m_retry.start()] + retry_repl + txt[m_retry.end() :]
-
-    m_fetch = re.search(
-        r'async function\s+([$\w]+)\s*\(\s*([$\w]+)\s*,\s*([$\w]+)\s*,\s*([$\w]+)\s*\)\s*\{\s*'
-        r'const\s+[$\w]+\s*=\s*new AbortController\(\);\s*'
-        r'let\s+[$\w]+\s*=\s*!1,\s*[$\w]+;\s*'
-        r'[\s\S]{0,250}?return await fetch\([^)]+\);\s*\}\s*catch[\s\S]{0,160}?\}\s*\}',
-        txt,
-    )
-    if not m_fetch:
-        raise RuntimeError("Failed to locate fetch wrapper sg() in main.mjs")
-    fn_name, url_arg, opt_arg, to_arg = m_fetch.group(1), m_fetch.group(2), m_fetch.group(3), m_fetch.group(4)
-    new_fetch_fn = (
-        f'async function {fn_name}({url_arg}, {opt_arg}, {to_arg}) {{\n'
-        f'  const _to = {to_arg} && {to_arg} > 0 ? Math.max({to_arg}, 30000) : 30000;\n'
-        f'  const _ac = new AbortController();\n'
-        f'  let _aborted = !1;\n'
-        f'  const _timer = setTimeout(() => {{ _aborted = !0; _ac.abort(); }}, _to);\n'
-        f'  try {{\n'
-        f'    const _fn = {net_var} && typeof {net_var}.fetch === "function" ? {net_var}.fetch.bind({net_var}) : fetch;\n'
-        f'    return await _fn({url_arg}.toString(), {{ ...{opt_arg}, signal: _ac.signal }});\n'
-        f'  }} catch (_err) {{\n'
-        f'    throw _aborted ? new Error(`timeout of ${{_to}}ms exceeded`) : _err;\n'
-        f'  }} finally {{\n'
-        f'    clearTimeout(_timer);\n'
-        f'  }}\n'
-        f'}}'
-    )
-    txt = txt[: m_fetch.start()] + new_fetch_fn + txt[m_fetch.end() :]
-
-    # 6. Hook autoUpdater setup function Wm(getWin) -> delegate to linux_updater.mjs on Linux
-    m_upd = re.search(
-        r'(function\s+[$\w]+\s*\(\s*([$\w]+)\s*\)\s*\{)([\s\S]{0,800}?autoUpdater\.logger\s*=\s*\{\s*info:\s*\([$\w]+\)\s*=>\s*([$\w]+)\([\s\S]{0,4000}?([$\w]+)\(\)\s*,\s*[$\w]+\.autoUpdater\.quitAndInstall\(\);)',
-        txt,
-    )
-    if not m_upd:
-        raise RuntimeError("Failed to locate autoUpdater setup function in main.mjs")
-    fn_head, get_win_arg, log_fn, quit_fn = m_upd.group(1), m_upd.group(2), m_upd.group(4), m_upd.group(5)
-    linux_upd_hook = (
-        f'{fn_head}\n'
-        f'  if (process.platform === "linux") {{\n'
-        f'    _registerLinuxUpdater({{ app: {app_var}, ipcMain: {ipc_var}, net: {net_var}, getMainWindow: {get_win_arg}, log: {log_fn}, onBeforeQuitForUpdate: {quit_fn} }});\n'
-        f'    return;\n'
-        f'  }}'
-    )
-    txt = txt[: m_upd.start(1)] + linux_upd_hook + txt[m_upd.end(1) :]
-
-    main_path.write_text(txt, encoding="utf-8")
-    return main_path
+    raise RuntimeError(f"Missing {main_mjs} or {main_cjs}")
 
 
 def patch_frontend_assets(app_new: Path, target_root: Path) -> list[Path]:
     assets_dir = app_new / "dist" / "assets"
+    dist_dir = app_new / "dist"
     touched: list[Path] = []
 
-    # 1. WIN 68 HE (rlw) Host RGB Sync exit packet on connect
-    rlw_patched = 0
-    for p in sorted(assets_dir.glob("info-*.js")):
-        s = p.read_text(encoding="utf-8", errors="ignore")
-        if "usagePage===e.usagePage&&r.usage===e.usage" in s:
-            if "s&&!s.opened&&await s.open();" not in s:
-                raise RuntimeError(f"Expected open sequence missing in {p.name}")
-            s = s.replace(
-                "s&&!s.opened&&await s.open();",
-                "s&&!s.opened&&await s.open();if(s&&s.opened){try{const _syncOff=new Uint8Array(63);_syncOff[0]=23,_syncOff[4]=2,await s.sendReport(1,_syncOff)}catch{}}",
-                1,
+    # 1. Install runtime renderer shim into dist/ and inject into dist/index.html
+    shim_src = target_root / "linux_renderer_shim.js"
+    if not shim_src.is_file():
+        shim_src = ROOT_DIR / "linux_renderer_shim.js"
+    if not shim_src.is_file():
+        raise RuntimeError(f"Missing linux_renderer_shim.js in {target_root} or {ROOT_DIR}")
+
+    shim_dst = dist_dir / "linux_renderer_shim.js"
+    shutil.copy2(shim_src, shim_dst)
+    touched.append(shim_dst)
+
+    index_html = dist_dir / "index.html"
+    if index_html.is_file():
+        html = index_html.read_text(encoding="utf-8")
+        if "linux_renderer_shim.js" not in html:
+            tag = '<script src="./linux_renderer_shim.js"></script>'
+            new_html, n_rep = re.subn(
+                r"(<head(?:\s[^>]*)?>)",
+                rf"\1\n    {tag}",
+                html,
+                count=1,
+                flags=re.IGNORECASE,
             )
-            p.write_text(s, encoding="utf-8")
-            touched.append(p)
-            rlw_patched += 1
-    if rlw_patched == 0:
-        raise RuntimeError("Could not find info-*.js with WIN 68 HE usagePage/usage matcher")
+            if n_rep == 0:
+                new_html = f"{tag}\n{html}"
+            index_html.write_text(new_html, encoding="utf-8")
 
-    # Default fallback -> "en" in index-*.js when no saved preference exists
-    idx_patched = 0
-    for p in sorted(assets_dir.glob("index-*.js")):
-        s = p.read_text(encoding="utf-8", errors="ignore")
-        if "createI18n" not in s:
-            continue
+    # 2. Best-effort legacy unobfuscated bundle patches (non-fatal on obfuscated 1.3.9+ builds)
+    if assets_dir.is_dir():
+        for p in sorted(assets_dir.glob("info-*.js")):
+            s = p.read_text(encoding="utf-8", errors="ignore")
+            if "usagePage===e.usagePage&&r.usage===e.usage" in s and "s&&!s.opened&&await s.open();" in s:
+                s = s.replace(
+                    "s&&!s.opened&&await s.open();",
+                    "s&&!s.opened&&await s.open();if(s&&s.opened){try{const _syncOff=new Uint8Array(63);_syncOff[0]=23,_syncOff[4]=2,await s.sendReport(1,_syncOff)}catch{}}",
+                    1,
+                )
+                p.write_text(s, encoding="utf-8")
+                touched.append(p)
 
-        # Default fallback -> "en" when no saved preference exists
-        s = re.sub(
-            r'if\(!\w+\)return"zh";const (\w+)=JSON\.parse\(\w+\);return\(\1==null\?void 0:\1\.language\)\|\|"zh"\}catch\{return"zh"\}',
-            lambda m: m.group(0).replace('"zh"', '"en"'),
-            s,
-            count=1,
-        )
-        s = re.sub(
-            r'createI18n\(\{legacy:!1,locale:"zh",fallbackLocale:"zh"',
-            'createI18n({legacy:!1,locale:"en",fallbackLocale:"en"',
-            s,
-            count=1,
-        )
-        s = s.replace(',language:"zh",ACC_Config:', ',language:"en",ACC_Config:', 1)
-        p.write_text(s, encoding="utf-8")
-        touched.append(p)
-        idx_patched += 1
-    if idx_patched == 0:
-        raise RuntimeError("Could not find index-*.js with createI18n")
+        for p in sorted(assets_dir.glob("index-*.js")):
+            s = p.read_text(encoding="utf-8", errors="ignore")
+            if "createI18n" not in s:
+                continue
+            orig_s = s
+            s = re.sub(
+                r'if\(!\w+\)return"zh";const (\w+)=JSON\.parse\(\w+\);return\(\1==null\?void 0:\1\.language\)\|\|"zh"\}catch\{return"zh"\}',
+                lambda m: m.group(0).replace('"zh"', '"en"'),
+                s,
+                count=1,
+            )
+            s = re.sub(
+                r'createI18n\(\{legacy:!1,locale:"zh",fallbackLocale:"zh"',
+                'createI18n({legacy:!1,locale:"en",fallbackLocale:"en"',
+                s,
+                count=1,
+            )
+            s = s.replace(',language:"zh",ACC_Config:', ',language:"en",ACC_Config:', 1)
+            if s != orig_s:
+                p.write_text(s, encoding="utf-8")
+                touched.append(p)
 
     return touched
 
 
-def extract_and_build(source: Path, target_root: Path) -> None:
+def extract_and_build(source: Path, target_root: Path, install_sharp: bool = False) -> None:
     target_root.mkdir(parents=True, exist_ok=True)
     app_dir = target_root / "app"
     app_new = target_root / "app.new"
@@ -481,7 +530,12 @@ def extract_and_build(source: Path, target_root: Path) -> None:
 
     # Ensure support scripts exist in target_root if testing an alternate directory
     if target_root.resolve() != ROOT_DIR.resolve():
-        for fname in ("linux_updater.mjs", "patch_notifications_en.mjs"):
+        for fname in (
+            "linux_updater.mjs",
+            "linux_main_shim.mjs",
+            "linux_renderer_shim.js",
+            "patch_notifications_en.mjs",
+        ):
             src_f = ROOT_DIR / fname
             if src_f.is_file():
                 shutil.copy2(src_f, target_root / fname)
@@ -543,11 +597,11 @@ def extract_and_build(source: Path, target_root: Path) -> None:
             shutil.copy2(fallback_ico, public_ico)
 
     print(f"Unpacked app.asar ({asar_cnt} files) + unpacked ({unpacked_cnt} files)")
-    ensure_linux_sharp(app_new, app_dir)
+    ensure_linux_sharp(app_new, app_dir, install_sharp=install_sharp)
 
     patched_files: list[Path] = [
         patch_icon_worker(app_new),
-        patch_main_mjs(app_new),
+        *patch_main_mjs(app_new),
         *patch_frontend_assets(app_new, target_root),
     ]
 
@@ -556,16 +610,20 @@ def extract_and_build(source: Path, target_root: Path) -> None:
         patch_notif_script = ROOT_DIR / "patch_notifications_en.mjs"
     if patch_notif_script.is_file():
         node_bin_notif = find_node()
-        subprocess.run([node_bin_notif, str(patch_notif_script), str(app_new)], check=True)
-        for cand in (
-            app_new / "dist-electron" / "main.mjs",
-            *sorted((app_new / "dist" / "assets").glob("*.js")),
-        ):
-            if cand.is_file() and cand not in patched_files and any(
-                cand.name.startswith(pref)
-                for pref in ("main.", "index-", "element-plus-", "key-", "softwarePicker-", "info-")
-            ):
-                patched_files.append(cand)
+        notif_res = subprocess.run(
+            [node_bin_notif, str(patch_notif_script), str(app_new)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        if notif_res.stdout:
+            print(notif_res.stdout.rstrip())
+        for line in notif_res.stdout.splitlines():
+            if line.startswith(" - "):
+                rel = line[3:].strip()
+                cand = app_new / rel
+                if cand.is_file() and cand.suffix in (".js", ".mjs") and cand not in patched_files:
+                    patched_files.append(cand)
 
     node_bin = find_node()
     for pf in patched_files:
@@ -587,12 +645,93 @@ def extract_and_build(source: Path, target_root: Path) -> None:
     print(f"Updated {app_dir} successfully (previous version backed up in {app_bak})")
 
 
-def download_and_verify_latest(dest_dir: Path) -> tuple[dict[str, str], Path]:
-    info = fetch_latest_info()
-    url = urllib.parse.urljoin(UPDATE_BASE_URL, urllib.parse.quote(info["path"]))
-    safe_ver = re.sub(r"[^a-zA-Z0-9._-]", "_", info["version"])
-    dest = dest_dir / f"aula-hub-update-{safe_ver}.exe"
-    print(f"Downloading {info['version']} from {url} ...")
+def get_cache_dir() -> Path:
+    override = os.environ.get("AULA_UPDATE_CACHE_DIR", "").strip()
+    if override:
+        d = Path(override).expanduser().resolve()
+    else:
+        xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+        base = Path(xdg).expanduser() if xdg else (Path.home() / ".cache")
+        d = (base / "aula-hub-linux").resolve()
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def has_pe_magic(file_path: Path) -> bool:
+    try:
+        with file_path.open("rb") as f:
+            return f.read(2) == b"MZ"
+    except OSError:
+        return False
+
+
+def verify_installer(
+    file_path: Path, expected_sha256: str = "", expected_sha512: str = ""
+) -> tuple[bool, str]:
+    if not file_path.is_file() or file_path.stat().st_size < 1024 or not has_pe_magic(file_path):
+        return False, "invalid-pe"
+    if expected_sha256:
+        h = hashlib.sha256()
+        with file_path.open("rb") as f:
+            while chunk := f.read(256 * 1024):
+                h.update(chunk)
+        return h.hexdigest().lower() == expected_sha256.lower(), "sha256"
+    if expected_sha512:
+        h = hashlib.sha512()
+        with file_path.open("rb") as f:
+            while chunk := f.read(256 * 1024):
+                h.update(chunk)
+        digest = base64.b64encode(h.digest()).decode("ascii")
+        return digest == expected_sha512, "sha512"
+    return True, "pe"
+
+
+def probe_remote_range(url: str) -> tuple[int, bool]:
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    if not shutil.which("curl"):
+        return 0, False
+    try:
+        res = subprocess.run(
+            [
+                "curl",
+                "-4",
+                "--http1.1",
+                "-fsSIL",
+                "--connect-timeout",
+                "10",
+                "--max-time",
+                "15",
+                "-A",
+                "electron-updater",
+                url,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except Exception:
+        return 0, False
+
+    content_len = 0
+    accept_ranges = False
+    blocks = [b for b in re.split(r"\r?\n\r?\n", res.stdout.strip()) if b.strip()]
+    last_block = blocks[-1] if blocks else ""
+    for line in last_block.splitlines():
+        low = line.lower()
+        if low.startswith("content-length:"):
+            try:
+                content_len = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+        elif low.startswith("accept-ranges:") and "bytes" in low:
+            accept_ranges = True
+
+    if host in SINGLE_STREAM_ONLY_HOSTS:
+        accept_ranges = False
+    return content_len, accept_ranges
+
+
+def _download_single_stream(url: str, part_path: Path) -> None:
     if shutil.which("curl"):
         subprocess.run(
             [
@@ -616,27 +755,212 @@ def download_and_verify_latest(dest_dir: Path) -> tuple[dict[str, str], Path]:
                 "-A",
                 "electron-updater",
                 "-o",
-                str(dest),
+                str(part_path),
                 url,
             ],
             check=True,
         )
-        h = hashlib.sha512()
-        with dest.open("rb") as f:
-            while chunk := f.read(256 * 1024):
-                h.update(chunk)
-    else:
-        req = urllib.request.Request(url, headers={"User-Agent": "electron-updater"})
-        h = hashlib.sha512()
-        with urllib.request.urlopen(req, timeout=120) as resp, dest.open("wb") as out:
-            while chunk := resp.read(256 * 1024):
-                h.update(chunk)
-                out.write(chunk)
-    digest = base64.b64encode(h.digest()).decode("ascii")
-    if info.get("sha512") and digest != info["sha512"]:
+        return
+    req = urllib.request.Request(url, headers={"User-Agent": "electron-updater"})
+    with urllib.request.urlopen(req, timeout=120) as resp, part_path.open("wb") as out:
+        while chunk := resp.read(256 * 1024):
+            out.write(chunk)
+
+
+def _download_parallel_ranges(
+    url: str,
+    part_path: Path,
+    total_size: int,
+    workers: int = DEFAULT_PARALLEL_WORKERS,
+    chunk_size: int = DEFAULT_CHUNK_BYTES,
+) -> None:
+    meta_path = Path(f"{part_path}.meta.json")
+    num_chunks = (total_size + chunk_size - 1) // chunk_size
+    done_set: set[int] = set()
+
+    if meta_path.is_file() and part_path.is_file() and part_path.stat().st_size == total_size:
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if (
+                meta.get("url") == url
+                and meta.get("total") == total_size
+                and meta.get("chunk_size") == chunk_size
+                and isinstance(meta.get("done"), list)
+            ):
+                done_set = {int(i) for i in meta["done"] if 0 <= int(i) < num_chunks}
+        except Exception:
+            done_set = set()
+
+    if not done_set:
+        with part_path.open("wb") as f:
+            f.truncate(total_size)
+
+    pending = [i for i in range(num_chunks) if i not in done_set]
+    completed_bytes = sum(
+        min(chunk_size, total_size - i * chunk_size) for i in done_set
+    )
+    if not pending:
+        meta_path.unlink(missing_ok=True)
+        return
+
+    fd = os.open(str(part_path), os.O_RDWR)
+    lock = threading.Lock()
+    start_ts = time.monotonic()
+    downloaded_this_run = 0
+    is_tty = sys.stdout.isatty()
+
+    def save_meta() -> None:
+        meta_tmp = Path(f"{meta_path}.tmp")
+        meta_tmp.write_text(
+            json.dumps(
+                {
+                    "url": url,
+                    "total": total_size,
+                    "chunk_size": chunk_size,
+                    "done": sorted(done_set),
+                }
+            ),
+            encoding="utf-8",
+        )
+        meta_tmp.replace(meta_path)
+
+    def print_progress() -> None:
+        elapsed = max(0.001, time.monotonic() - start_ts)
+        speed_kbs = downloaded_this_run / 1024.0 / elapsed
+        pct = min(100.0, (completed_bytes * 100.0) / total_size)
+        speed_str = f"{speed_kbs / 1024.0:.2f} MB/s" if speed_kbs >= 1024 else f"{speed_kbs:.0f} KB/s"
+        msg = (
+            f"Downloading ({workers} streams): {pct:5.1f}% "
+            f"({completed_bytes / (1024 * 1024):.1f}/{total_size / (1024 * 1024):.1f} MB) | {speed_str}"
+        )
+        if is_tty:
+            print(f"\r{msg:<78}", end="", flush=True)
+        elif len(done_set) == num_chunks or len(done_set) % max(1, num_chunks // 10) == 0:
+            print(msg, flush=True)
+
+    def fetch_chunk(idx: int) -> None:
+        nonlocal completed_bytes, downloaded_this_run
+        start = idx * chunk_size
+        end = min(total_size - 1, start + chunk_size - 1)
+        expected_len = end - start + 1
+        last_err: Exception | None = None
+        for attempt in range(4):
+            try:
+                res = subprocess.run(
+                    [
+                        "curl",
+                        "-4",
+                        "--http1.1",
+                        "-fsSL",
+                        "--connect-timeout",
+                        "12",
+                        "--speed-limit",
+                        "1024",
+                        "--speed-time",
+                        "25",
+                        "-A",
+                        "electron-updater",
+                        "-r",
+                        f"{start}-{end}",
+                        url,
+                    ],
+                    capture_output=True,
+                    check=True,
+                )
+                data = res.stdout
+                if len(data) != expected_len:
+                    raise RuntimeError(
+                        f"Range chunk {idx} size mismatch: got {len(data)}, expected {expected_len}"
+                    )
+                os.pwrite(fd, data, start)
+                with lock:
+                    done_set.add(idx)
+                    completed_bytes += expected_len
+                    downloaded_this_run += expected_len
+                    save_meta()
+                    print_progress()
+                return
+            except Exception as exc:
+                last_err = exc
+                time.sleep(min(4.0, 0.8 * (attempt + 1)))
+        raise RuntimeError(f"Chunk {idx} failed after retries: {last_err}")
+
+    try:
+        if done_set:
+            print(
+                f"Resuming cached download: {len(done_set)}/{num_chunks} chunks already complete"
+            )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(fetch_chunk, i) for i in pending]
+            for fut in concurrent.futures.as_completed(futs):
+                fut.result()
+        if is_tty:
+            print("")
+        meta_path.unlink(missing_ok=True)
+    finally:
+        os.close(fd)
+
+
+def prune_old_cached_installers(cache_dir: Path, keep_path: Path) -> None:
+    try:
+        for item in cache_dir.glob("aula-hub-update-*"):
+            if item.resolve() == keep_path.resolve():
+                continue
+            if item.is_file():
+                item.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def download_and_verify_latest(
+    dest_dir: Path,
+    workers: int = DEFAULT_PARALLEL_WORKERS,
+    chunk_size: int = DEFAULT_CHUNK_BYTES,
+) -> tuple[dict[str, str], Path]:
+    info = fetch_latest_info()
+    url = info.get("url") or urllib.parse.urljoin(UPDATE_BASE_URL, urllib.parse.quote(info["path"]))
+    safe_ver = re.sub(r"[^a-zA-Z0-9._-]", "_", info["version"])
+    dest = dest_dir / f"aula-hub-update-{safe_ver}.exe"
+    expected_sha256 = info.get("sha256", "")
+    expected_sha512 = info.get("sha512", "")
+
+    if dest.is_file():
+        ok, alg = verify_installer(dest, expected_sha256, expected_sha512)
+        if ok:
+            print(f"Reused verified cached installer {dest} ({alg} OK)")
+            return info, dest
         dest.unlink(missing_ok=True)
-        raise RuntimeError("SHA-512 mismatch on downloaded installer")
-    print(f"Downloaded and verified {dest} (sha512 OK)")
+
+    part_path = Path(f"{dest}.part")
+    print(f"Downloading {info['version']} from {url} ...")
+
+    total_size, supports_ranges = probe_remote_range(url)
+    used_parallel = False
+    if supports_ranges and workers > 1 and total_size >= chunk_size:
+        try:
+            _download_parallel_ranges(
+                url, part_path, total_size, workers=workers, chunk_size=chunk_size
+            )
+            used_parallel = True
+        except Exception as exc:
+            print(
+                f"\nParallel download interrupted ({exc}); falling back to single-stream resume...",
+                file=sys.stderr,
+            )
+            Path(f"{part_path}.meta.json").unlink(missing_ok=True)
+            part_path.unlink(missing_ok=True)
+
+    if not used_parallel:
+        _download_single_stream(url, part_path)
+
+    ok, alg = verify_installer(part_path, expected_sha256, expected_sha512)
+    if not ok:
+        part_path.unlink(missing_ok=True)
+        Path(f"{part_path}.meta.json").unlink(missing_ok=True)
+        raise RuntimeError(f"Checksum/PE verification failed ({alg}) on downloaded installer")
+
+    part_path.replace(dest)
+    print(f"Downloaded and verified {dest} ({alg} OK)")
     return info, dest
 
 
@@ -648,6 +972,9 @@ def main() -> int:
     parser.add_argument("--wait-pid", type=int, default=0, help="Wait for running PID to exit before swap")
     parser.add_argument("--relaunch", action="store_true", help="Relaunch aula-hub after update")
     parser.add_argument("--target-dir", default=str(ROOT_DIR), help="Target directory containing app/")
+    parser.add_argument("--workers", type=int, default=DEFAULT_PARALLEL_WORKERS, help="Parallel HTTP range connections")
+    parser.add_argument("--no-cache", action="store_true", help="Remove downloaded installer after successful install")
+    parser.add_argument("--with-sharp", action="store_true", help="Also install Linux sharp binary via npm")
     args = parser.parse_args()
 
     target_root = Path(args.target_dir).resolve()
@@ -657,30 +984,31 @@ def main() -> int:
         cur_ver = json.loads(pkg.read_text(encoding="utf-8")).get("version", "unknown") if pkg.is_file() else "none"
         info = fetch_latest_info()
         print(f"Current version: {cur_ver}")
-        print(f"Latest version:  {info.get('version')} ({info.get('path')}, size={info.get('size')})")
+        print(f"Latest version:  {info.get('version')} ({info.get('url') or info.get('path')}, size={info.get('size', 'unknown')})")
         return 0
 
     if args.wait_pid > 0:
         wait_for_pid_exit(args.wait_pid)
 
-    cleanup_path: Path | None = None
+    cache_dir = get_cache_dir()
+    downloaded_to_cache = False
     if args.latest:
-        _, src_path = download_and_verify_latest(Path("/tmp"))
-        cleanup_path = src_path
+        _, src_path = download_and_verify_latest(cache_dir, workers=max(1, args.workers))
+        downloaded_to_cache = True
     elif args.source:
         src_path = Path(args.source).resolve()
         if not src_path.is_file():
             raise FileNotFoundError(f"Installer not found: {src_path}")
-        if src_path.parent == Path("/tmp") and src_path.name.startswith("aula-hub-update-"):
-            cleanup_path = src_path
     else:
         parser.error("Provide an installer path, --check, or --latest")
 
-    try:
-        extract_and_build(src_path, target_root)
-    finally:
-        if cleanup_path and cleanup_path.exists():
-            cleanup_path.unlink(missing_ok=True)
+    extract_and_build(src_path, target_root, install_sharp=args.with_sharp)
+
+    if downloaded_to_cache:
+        if args.no_cache:
+            src_path.unlink(missing_ok=True)
+        else:
+            prune_old_cached_installers(cache_dir, src_path)
 
     if args.relaunch:
         launcher = target_root / "aula-hub"

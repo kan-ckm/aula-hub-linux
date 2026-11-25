@@ -16,8 +16,9 @@ const DEFAULT_APP_DIR = path.resolve(
 const appDir = path.resolve(process.argv[2] || DEFAULT_APP_DIR);
 const assetsDir = path.join(appDir, "dist", "assets");
 const mainPath = path.join(appDir, "dist-electron", "main.mjs");
+const mainCjsPath = path.join(appDir, "dist-electron", "main.cjs");
 
-if (!fs.existsSync(assetsDir) || !fs.existsSync(mainPath)) {
+if (!fs.existsSync(assetsDir) || (!fs.existsSync(mainPath) && !fs.existsSync(mainCjsPath))) {
   console.error(`Invalid AULA HUB app directory: ${appDir}`);
   process.exit(1);
 }
@@ -150,13 +151,12 @@ function patchIndexBundle() {
       const toastRe =
         /function\s+([$\w]+)\(([$\w]+),([$\w]+)="success",([$\w]+)=3e3\)\{const\s+([$\w]+)=([$\w]+)\+\+;([$\w]+)\.value\.push\(\{id:\5,message:\2,type:\3,leaving:!1\}\)/;
       const m = toastRe.exec(txt);
-      if (!m) {
-        throw new Error(`Could not locate toast function in ${fname}`);
+      if (m) {
+        const [full, fnName, msgArg, typeArg, durArg, idVar, seqVar, arrVar] = m;
+        const repl = `${EN_TOAST_HELPER}function ${fnName}(${msgArg},${typeArg}="success",${durArg}=3e3){const ${idVar}=${seqVar}++;${arrVar}.value.push({id:${idVar},message:_enTrMsg(${msgArg}),type:${typeArg},leaving:!1})`;
+        txt = txt.slice(0, m.index) + repl + txt.slice(m.index + full.length);
+        changed = true;
       }
-      const [full, fnName, msgArg, typeArg, durArg, idVar, seqVar, arrVar] = m;
-      const repl = `${EN_TOAST_HELPER}function ${fnName}(${msgArg},${typeArg}="success",${durArg}=3e3){const ${idVar}=${seqVar}++;${arrVar}.value.push({id:${idVar},message:_enTrMsg(${msgArg}),type:${typeArg},leaving:!1})`;
-      txt = txt.slice(0, m.index) + repl + txt.slice(m.index + full.length);
-      changed = true;
     }
 
     const batRe =
@@ -183,7 +183,9 @@ function patchIndexBundle() {
   }
 
   if (!patchedAny) {
-    throw new Error("Could not find main index-*.js bundle");
+    console.log(
+      "patch_notifications_en.mjs: obfuscated frontend bundle detected; runtime English translation handled by linux_renderer_shim.js"
+    );
   }
 }
 
@@ -323,6 +325,7 @@ function patchChildChunks() {
 }
 
 function patchMainProcess() {
+  if (!fs.existsSync(mainPath)) return;
   let txt = fs.readFileSync(mainPath, "utf8");
   let changed = false;
 

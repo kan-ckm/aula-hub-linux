@@ -27,9 +27,23 @@ const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)));
 const MAX_STREAM_RETRIES = 30;
 const CONNECT_TIMEOUT_MS = 15000;
 const REQUEST_TIMEOUT_MS = 60000;
+const PARALLEL_WORKERS = 4;
+const PARALLEL_CHUNK_BYTES = 4 * 1024 * 1024;
+const SINGLE_STREAM_ONLY_HOSTS = new Set(["toolsuse.aulacn.com"]);
 
 const http1Agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
 const https1Agent = new https.Agent({ keepAlive: true, maxSockets: 1 });
+const cdnHttp1Agent = new http.Agent({ keepAlive: true, maxSockets: PARALLEL_WORKERS });
+const cdnHttps1Agent = new https.Agent({ keepAlive: true, maxSockets: PARALLEL_WORKERS });
+
+function getDefaultCacheDir() {
+  if (process.env.AULA_UPDATE_CACHE_DIR) {
+    return path.resolve(process.env.AULA_UPDATE_CACHE_DIR);
+  }
+  const xdg = (process.env.XDG_CACHE_HOME || "").trim();
+  const base = xdg || path.join(os.homedir(), ".cache");
+  return path.join(base, "aula-hub-linux");
+}
 
 function makeAbortError(message = "Operation aborted") {
   const err = new Error(message);
@@ -70,6 +84,7 @@ function requestHttp1(urlStr, options = {}, redirectCount = 0) {
     signal = null,
     timeoutMs = REQUEST_TIMEOUT_MS,
     maxRedirects = 5,
+    parallel = false,
   } = options;
 
   return new Promise((resolve, reject) => {
@@ -115,12 +130,21 @@ function requestHttp1(urlStr, options = {}, redirectCount = 0) {
       signal.addEventListener("abort", onAbort, { once: true });
     }
 
+    const agent =
+      parsed.protocol === "http:"
+        ? parallel
+          ? cdnHttp1Agent
+          : http1Agent
+        : parallel
+          ? cdnHttps1Agent
+          : https1Agent;
+
     req = transport.request(
       parsed,
       {
         method,
         family: 4,
-        agent: parsed.protocol === "http:" ? http1Agent : https1Agent,
+        agent,
         headers: {
           "User-Agent": "electron-updater",
           ...headers,
@@ -142,7 +166,7 @@ function requestHttp1(urlStr, options = {}, redirectCount = 0) {
           const nextMethod = status === 303 && method !== "HEAD" ? "GET" : method;
           requestHttp1(
             nextUrl,
-            { method: nextMethod, headers, signal, timeoutMs, maxRedirects },
+            { method: nextMethod, headers, signal, timeoutMs, maxRedirects, parallel },
             redirectCount + 1
           ).then(resolve, reject);
           return;
@@ -191,8 +215,8 @@ function requestHttp1(urlStr, options = {}, redirectCount = 0) {
   });
 }
 
-async function computeFileSha512Base64(filePath, signal) {
-  const hash = crypto.createHash("sha512");
+async function computeFileHash(filePath, algorithm, encoding, signal) {
+  const hash = crypto.createHash(algorithm);
   const stream = fs.createReadStream(filePath, { highWaterMark: 256 * 1024 });
   try {
     for await (const chunk of stream) {
@@ -201,9 +225,35 @@ async function computeFileSha512Base64(filePath, signal) {
       }
       hash.update(chunk);
     }
-    return hash.digest("base64");
+    return hash.digest(encoding);
   } finally {
     stream.destroy();
+  }
+}
+
+function computeFileSha512Base64(filePath, signal) {
+  return computeFileHash(filePath, "sha512", "base64", signal);
+}
+
+function computeFileSha256Hex(filePath, signal) {
+  return computeFileHash(filePath, "sha256", "hex", signal);
+}
+
+function hasPeMagic(filePath) {
+  let fd = null;
+  try {
+    fd = fs.openSync(filePath, "r");
+    const buf = Buffer.alloc(2);
+    const n = fs.readSync(fd, buf, 0, 2, 0);
+    return n === 2 && buf[0] === 0x4d && buf[1] === 0x5a;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
   }
 }
 
@@ -383,10 +433,19 @@ export function registerLinuxUpdater({
         if (status === 200) {
           if (received > 0) {
             received = 0;
-            setBytesProgress(0);
+            setBytesProgress(0, expectedTotalBytes);
+          }
+          const cl = Number(res.headers["content-length"]) || 0;
+          if (!expectedTotalBytes && cl > 0) {
+            expectedTotalBytes = cl;
           }
           fh = await fs.promises.open(destPath, "w");
         } else if (status === 206 && received > 0) {
+          const cr = String(res.headers["content-range"] || "");
+          const mCr = /\/(\d+)$/.exec(cr);
+          if (!expectedTotalBytes && mCr) {
+            expectedTotalBytes = Number(mCr[1]) || 0;
+          }
           fh = await fs.promises.open(destPath, "r+");
         } else {
           res.resume();
@@ -398,7 +457,7 @@ export function registerLinuxUpdater({
           const buf = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
           await fh.write(buf, 0, buf.length, received);
           received += buf.length;
-          setBytesProgress(received);
+          setBytesProgress(received, expectedTotalBytes);
         }
 
         await fh.close();
@@ -431,6 +490,101 @@ export function registerLinuxUpdater({
     }
   };
 
+  const probeRangeSupport = async (urlStr, signal) => {
+    try {
+      const host = new URL(urlStr).hostname.toLowerCase();
+      if (SINGLE_STREAM_ONLY_HOSTS.has(host)) {
+        return { totalBytes: 0, supportsRanges: false };
+      }
+      const { res } = await requestHttp1(urlStr, {
+        method: "HEAD",
+        signal,
+        timeoutMs: 15000,
+      });
+      res.resume();
+      const totalBytes = Number(res.headers["content-length"]) || 0;
+      const acceptRanges = String(res.headers["accept-ranges"] || "").toLowerCase();
+      return {
+        totalBytes,
+        supportsRanges: res.statusCode === 200 && acceptRanges.includes("bytes"),
+      };
+    } catch {
+      return { totalBytes: 0, supportsRanges: false };
+    }
+  };
+
+  const downloadParallelRanges = async (
+    urlStr,
+    destPath,
+    totalBytes,
+    signal,
+    setBytesProgress
+  ) => {
+    const chunkSize = PARALLEL_CHUNK_BYTES;
+    const numChunks = Math.ceil(totalBytes / chunkSize);
+    const fh = await fs.promises.open(destPath, "w+");
+    let receivedTotal = 0;
+    let nextIdx = 0;
+    try {
+      await fh.truncate(totalBytes);
+      const worker = async () => {
+        while (true) {
+          if (signal.aborted) throw makeAbortError();
+          const idx = nextIdx++;
+          if (idx >= numChunks) return;
+          const start = idx * chunkSize;
+          const end = Math.min(totalBytes - 1, start + chunkSize - 1);
+          const expectedLen = end - start + 1;
+
+          let lastErr = null;
+          let done = false;
+          for (let attempt = 0; attempt < 4; attempt++) {
+            try {
+              const { res } = await requestHttp1(urlStr, {
+                method: "GET",
+                headers: {
+                  "Accept-Encoding": "identity",
+                  Range: `bytes=${start}-${end}`,
+                },
+                signal,
+                timeoutMs: REQUEST_TIMEOUT_MS,
+                parallel: true,
+              });
+              if (res.statusCode !== 206) {
+                res.resume();
+                throw new Error(`Expected HTTP 206 for range ${start}-${end}, got ${res.statusCode}`);
+              }
+              let offset = start;
+              for await (const rawChunk of res) {
+                if (signal.aborted) throw makeAbortError();
+                const buf = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
+                await fh.write(buf, 0, buf.length, offset);
+                offset += buf.length;
+                receivedTotal += buf.length;
+                setBytesProgress(receivedTotal, totalBytes);
+              }
+              if (offset - start !== expectedLen) {
+                throw new Error(`Range chunk ${idx} incomplete (${offset - start}/${expectedLen})`);
+              }
+              done = true;
+              break;
+            } catch (err) {
+              if (isAbortError(err, signal)) throw err;
+              lastErr = err;
+              await sleep(Math.min(4000, 800 * (attempt + 1)), signal);
+            }
+          }
+          if (!done) throw lastErr || new Error(`Chunk ${idx} failed`);
+        }
+      };
+
+      const workers = Array.from({ length: Math.min(PARALLEL_WORKERS, numChunks) }, () => worker());
+      await Promise.all(workers);
+    } finally {
+      await fh.close().catch(() => {});
+    }
+  };
+
   ipcMain.handle("update:check", async () => {
     try {
       const info = await fetchLatestInfo();
@@ -453,7 +607,7 @@ export function registerLinuxUpdater({
     }
   });
 
-  ipcMain.handle("update:download", async () => {
+  ipcMain.handle("update:download", async (_event, directUrl, directSha256) => {
     if (activeAbort) {
       throw new Error("Update download already in progress");
     }
@@ -462,28 +616,58 @@ export function registerLinuxUpdater({
     cancelledByUser = false;
 
     try {
-      const info = cachedInfo || (await fetchLatestInfo());
-      const safeVer = String(info.version).replace(/[^a-zA-Z0-9._-]/g, "_");
-      const cacheDir = path.resolve(
-        process.env.AULA_UPDATE_CACHE_DIR || os.tmpdir()
-      );
+      const hasDirectUrl =
+        typeof directUrl === "string" && /^https?:\/\//i.test(directUrl.trim());
+      let url;
+      let expectedSize = 0;
+      let expectedSha512 = "";
+      let expectedSha256 = "";
+      let targetName;
+
+      if (hasDirectUrl) {
+        url = directUrl.trim();
+        const parsed = new URL(url);
+        let baseName = path.basename(parsed.pathname) || "aula-hub-update.exe";
+        try {
+          baseName = decodeURIComponent(baseName);
+        } catch {}
+        if (!baseName.toLowerCase().endsWith(".exe")) {
+          throw new Error(`Invalid installer file: ${baseName} (expected .exe)`);
+        }
+        const urlHash = crypto.createHash("sha256").update(url).digest("hex").slice(0, 12);
+        targetName = `aula-hub-update-${urlHash}.exe`;
+        expectedSha256 =
+          typeof directSha256 === "string" ? directSha256.trim().toLowerCase() : "";
+      } else {
+        const info = cachedInfo || (await fetchLatestInfo());
+        const safeVer = String(info.version).replace(/[^a-zA-Z0-9._-]/g, "_");
+        targetName = `aula-hub-update-${safeVer}.exe`;
+        url = new URL(encodeURI(info.path), UPDATE_BASE_URL).toString();
+        expectedSize = Number(info.size) || 0;
+        expectedSha512 = info.sha512 || "";
+      }
+
+      const cacheDir = getDefaultCacheDir();
       fs.mkdirSync(cacheDir, { recursive: true });
-      const targetExe = path.join(cacheDir, `aula-hub-update-${safeVer}.exe`);
+      const targetExe = path.join(cacheDir, targetName);
       activePartialPath = `${targetExe}.part`;
       downloadedInstallerPath = null;
 
-      // Fast path: reuse verified installer already downloaded in /tmp
+      // Fast path: reuse verified installer already downloaded in cacheDir
       if (fs.existsSync(targetExe)) {
         try {
           const st = fs.statSync(targetExe);
-          const expectedSize = Number(info.size) || 0;
-          if (!expectedSize || st.size === expectedSize) {
+          if ((!expectedSize || st.size === expectedSize) && hasPeMagic(targetExe)) {
             send("update-phase", "verifying");
-            const cachedDigest = await computeFileSha512Base64(
-              targetExe,
-              ac.signal
-            );
-            if (!info.sha512 || cachedDigest === info.sha512) {
+            let verified = true;
+            if (expectedSha256) {
+              const cached256 = await computeFileSha256Hex(targetExe, ac.signal);
+              verified = cached256.toLowerCase() === expectedSha256;
+            } else if (expectedSha512) {
+              const cached512 = await computeFileSha512Base64(targetExe, ac.signal);
+              verified = cached512 === expectedSha512;
+            }
+            if (verified) {
               downloadedInstallerPath = targetExe;
               send("update-progress", 100);
               send("update-downloaded");
@@ -507,17 +691,18 @@ export function registerLinuxUpdater({
       send("update-phase", "downloading");
       send("update-progress", 0);
 
-      const url = new URL(encodeURI(info.path), UPDATE_BASE_URL).toString();
       writeLog(
         "INFO",
         "UPDATE",
         `[linuxUpdater] Downloading ${url} via resumable HTTP/1.1`
       );
 
-      const totalBytes = Number(info.size) || 0;
-
+      let totalBytes = expectedSize;
       let lastPct = -1;
-      const setBytesProgress = (receivedBytes) => {
+      const setBytesProgress = (receivedBytes, discoveredTotal = 0) => {
+        if (discoveredTotal > 0 && discoveredTotal > totalBytes) {
+          totalBytes = discoveredTotal;
+        }
         if (totalBytes > 0) {
           const pct = Math.min(
             99,
@@ -530,29 +715,76 @@ export function registerLinuxUpdater({
         }
       };
 
-      await downloadResumableStream(
-        url,
-        activePartialPath,
-        totalBytes,
-        "",
-        ac.signal,
-        setBytesProgress
-      );
+      let usedParallel = false;
+      const hasExistingPart =
+        fs.existsSync(activePartialPath) && fs.statSync(activePartialPath).size > 0;
+      if (!hasExistingPart) {
+        const probed = await probeRangeSupport(url, ac.signal);
+        if (probed.totalBytes > totalBytes) {
+          totalBytes = probed.totalBytes;
+        }
+        if (probed.supportsRanges && totalBytes >= PARALLEL_CHUNK_BYTES) {
+          try {
+            await downloadParallelRanges(
+              url,
+              activePartialPath,
+              totalBytes,
+              ac.signal,
+              setBytesProgress
+            );
+            usedParallel = true;
+          } catch (parErr) {
+            if (isAbortError(parErr, ac.signal)) throw parErr;
+            writeLog(
+              "WARN",
+              "UPDATE",
+              `[linuxUpdater] Parallel range fallback to single stream: ${parErr.message || parErr}`
+            );
+            try {
+              if (fs.existsSync(activePartialPath)) fs.unlinkSync(activePartialPath);
+            } catch {}
+          }
+        }
+      }
+
+      if (!usedParallel) {
+        await downloadResumableStream(
+          url,
+          activePartialPath,
+          totalBytes,
+          "",
+          ac.signal,
+          setBytesProgress
+        );
+      }
 
       if (ac.signal.aborted) {
         throw makeAbortError();
       }
 
       send("update-phase", "verifying");
-      const digest = await computeFileSha512Base64(
-        activePartialPath,
-        ac.signal
-      );
-      if (info.sha512 && digest !== info.sha512) {
+      if (!hasPeMagic(activePartialPath)) {
         try {
           if (fs.existsSync(activePartialPath)) fs.unlinkSync(activePartialPath);
         } catch {}
-        throw new Error("SHA-512 verification failed for downloaded installer");
+        throw new Error("Downloaded installer is not a valid Windows executable");
+      }
+      if (expectedSha256) {
+        const digest256 = await computeFileSha256Hex(activePartialPath, ac.signal);
+        if (digest256.toLowerCase() !== expectedSha256) {
+          try {
+            if (fs.existsSync(activePartialPath)) fs.unlinkSync(activePartialPath);
+          } catch {}
+          throw new Error("SHA256 mismatch for downloaded installer");
+        }
+      } else if (expectedSha512) {
+        const digest512 = await computeFileSha512Base64(activePartialPath, ac.signal);
+        if (digest512 !== expectedSha512) {
+          try {
+            if (fs.existsSync(activePartialPath)) fs.unlinkSync(activePartialPath);
+          } catch {}
+          throw new Error("SHA-512 verification failed for downloaded installer");
+        }
       }
 
       fs.renameSync(activePartialPath, targetExe);
@@ -644,5 +876,9 @@ export function registerLinuxUpdater({
       fs.closeSync(logFd);
     } catch {}
     app.quit();
+    if (typeof app.exit === "function") {
+      const t = setTimeout(() => app.exit(0), 1500);
+      if (typeof t.unref === "function") t.unref();
+    }
   });
 }

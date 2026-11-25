@@ -2,20 +2,20 @@
 
 Linux wrapper, updater, and English runtime patcher for AULA HUB using system Electron and WebHID.
 
-No proprietary AULA binaries (`app.asar`, `.exe`) are included in this repository. The installer downloads the official installer from AULA (`toolsuse.aulacn.com`) or unpacks a local `.exe`/`.zip`, replaces Windows `sharp` with `@img/sharp-linux-x64`, and patches Electron/WebHID compatibility locally.
+No proprietary AULA binaries (`app.asar`, `.exe`) are included in this repository. The installer downloads the official installer from AULA (`hubapi.aulacn.com` / `cdn.aulacn.com`, with `toolsuse.aulacn.com` fallback) or unpacks a local `.exe`/`.zip`, caches verified installers in `~/.cache/aula-hub-linux`, and patches Electron/WebHID compatibility locally via obfuscation-resilient runtime shims.
 
 ## Requirements
 
 - `python3`
 - `7z` (`p7zip` / `p7zip-full`)
-- `nodejs` and `npm`
+- `nodejs`
 - `curl`
 - System `electron` (`electron41`..`electron36` or `electron` in `PATH`, or set `AULA_HUB_ELECTRON`)
 
 Arch Linux:
 
 ```bash
-sudo pacman -S electron python p7zip nodejs npm curl
+sudo pacman -S electron python p7zip nodejs curl
 ```
 
 ## Install
@@ -69,10 +69,11 @@ Uninstall:
 
 ## What Is Patched
 
-- `dist-electron/main.mjs`: disables Windows `HeadsetService.exe`, wraps `setLoginItemSettings`, selects vendor HID interfaces (`usagePage >= 0xFF00`), uses `electron.net.fetch` for API requests, and routes `update:*` IPC calls to `linux_updater.mjs`.
-- `dist-electron/iconWorker.mjs`: replaces `IconExtractor.exe` / PowerShell calls with direct base64 image reads.
-- `linux_updater.mjs`: resumable HTTP/1.1 Keep-Alive downloader (`Range: bytes=...`) with SHA-512 verification and atomic `app/` swap via `apply_update.py`.
-- `patch_notifications_en.mjs`: sets default locale fallback to `en` and translates remaining hardcoded Chinese UI/toast/dialog strings when running in English.
+- `linux_main_shim.mjs` + `dist-electron/main.mjs`: runtime Electron main-process shim (compatible with both obfuscated 1.3.9+ and legacy builds) that wraps `setLoginItemSettings`, selects vendor HID interfaces (`usagePage >= 0xFF00`), routes external `fetch()` through `electron.net.fetch`, stubs `headset-service-*` IPC handlers, translates main-process Chinese UI/notifications, injects `linux_renderer_shim.js` via `aula://`, and delegates `update:*` IPC calls to `linux_updater.mjs`.
+- `dist-electron/iconWorker.mjs`: replaces `IconExtractor.exe` / PowerShell calls with direct base64 image reads on Linux (no `sharp` native build required).
+- `linux_renderer_shim.js`: defaults first launch to English, sends the WIN 68 HE / WIN 60 HE Host RGB Sync exit packet on WebHID connect, and dynamically translates Chinese toast/dialog messages when running in English.
+- `linux_updater.mjs`: resumable multi-stream / HTTP/1.1 Keep-Alive downloader (`Range: bytes=...`) supporting both `update:download(url, sha256)` and `latest.yml` SHA-512 flows, caching verified installers in `~/.cache/aula-hub-linux` with atomic `app/` swap via `apply_update.py`.
+- `patch_notifications_en.mjs`: translates unobfuscated Element Plus / legacy frontend Chinese UI strings.
 
 ## Hardware Support
 

@@ -85,7 +85,7 @@ find_electron() {
 check_deps() {
   local missing=()
   local cmd
-  for cmd in python3 7z node npm curl; do
+  for cmd in python3 7z node curl; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       missing+=("$cmd")
     fi
@@ -94,9 +94,9 @@ check_deps() {
   if [[ ${#missing[@]} -gt 0 ]]; then
     echo "Missing required tools: ${missing[*]}" >&2
     echo "Install hints:" >&2
-    echo "  Arch Linux:   sudo pacman -S python p7zip nodejs npm curl electron" >&2
-    echo "  Debian/Ubuntu: sudo apt install python3 p7zip-full nodejs npm curl" >&2
-    echo "  Fedora:       sudo dnf install python3 p7zip p7zip-plugins nodejs npm curl" >&2
+    echo "  Arch Linux:   sudo pacman -S python p7zip nodejs curl electron" >&2
+    echo "  Debian/Ubuntu: sudo apt install python3 p7zip-full nodejs curl" >&2
+    echo "  Fedora:       sudo dnf install python3 p7zip p7zip-plugins nodejs curl" >&2
     exit 1
   fi
 
@@ -146,7 +146,7 @@ fi
 echo "Installing AULA HUB wrapper to: $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR/udev"
 
-for f in aula-hub apply_update.py linux_updater.mjs patch_notifications_en.mjs uninstall.sh; do
+for f in aula-hub apply_update.py linux_updater.mjs linux_main_shim.mjs linux_renderer_shim.js patch_notifications_en.mjs uninstall.sh; do
   if [[ -f "$SOURCE_DIR/$f" ]]; then
     cp -f "$SOURCE_DIR/$f" "$INSTALL_DIR/$f"
   fi
