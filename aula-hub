@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+export NODE_ENV=production
+
+find_electron() {
+  if [[ -n "${AULA_HUB_ELECTRON:-}" ]] && command -v "$AULA_HUB_ELECTRON" >/dev/null 2>&1; then
+    command -v "$AULA_HUB_ELECTRON"
+    return 0
+  fi
+  local cand
+  for cand in electron41 electron40 electron39 electron38 electron37 electron36 electron; do
+    if command -v "$cand" >/dev/null 2>&1; then
+      command -v "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+ELECTRON_BIN="$(find_electron || true)"
+if [[ -z "$ELECTRON_BIN" ]]; then
+  echo "Error: Electron runtime not found (tried electron41..electron36, electron)." >&2
+  echo "Install system Electron (e.g. 'sudo pacman -S electron' on Arch) or set AULA_HUB_ELECTRON." >&2
+  exit 1
+fi
+
+exec "$ELECTRON_BIN" \
+  --ozone-platform-hint=auto \
+  --enable-features=WaylandWindowDecorations \
+  --enable-experimental-web-platform-features \
+  "$DIR/app" "$@"

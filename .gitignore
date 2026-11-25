@@ -1,0 +1,22 @@
+# Proprietary AULA HUB extracted payload & temporary build artifacts
+app/
+app.new/
+app.bak/
+node_modules/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Downloaded installers, archives, partial downloads & logs
+*.exe
+*.zip
+*.7z
+*.part
+*.log
+
+# OS / editor noise
+.DS_Store
+*.swp
+*.tmp
