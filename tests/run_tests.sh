@@ -26,7 +26,7 @@ node --check "$ROOT_DIR/patch_notifications_en.mjs"
 FORBIDDEN_HOME="/home/""tomato"
 while IFS= read -r -d '' f; do
   case "$f" in
-    ./app/*|./app.new/*|./app.bak/*|./.git/*|./__pycache__/*|./tests/run_tests.sh) continue ;;
+    ./app/*|./app.new/*|./app.bak/*|./.git/*|./__pycache__/*|./graphify-out/*|./tests/run_tests.sh) continue ;;
   esac
   if grep -q "$FORBIDDEN_HOME" "$f"; then
     echo "FAIL: Forbidden personal path found in $f" >&2
