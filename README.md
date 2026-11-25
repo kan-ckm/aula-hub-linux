@@ -52,6 +52,25 @@ sudo install -Dm644 ~/.local/share/aula-hub-linux/udev/99-aula-hub.rules /etc/ud
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
+## Lightweight Background GIF LED (`aula-gifd`)
+
+Because per-key Live GIF lighting on WIN 68 HE / WIN 60 HE streams frames continuously from the host PC rather than storing them in keyboard flash, quitting the Electron UI normally resets the keyboard to its onboard lighting.
+
+`aula-hub-linux` solves this with a zero-dependency headless Node.js daemon (`aula-gifd`, ~20 MB RAM and <0.5% CPU vs ~900 MB RAM for Electron):
+
+- **Automatic GUI handoff**: If you quit AULA HUB while Live GIF lighting is active, `aula-gifd` automatically takes over streaming the exact frames in the background and yields cleanly whenever you reopen AULA HUB. Use **Exit & Stop GIF LED** in the tray menu to stop both.
+- **Direct CLI playback** (no Electron GUI required):
+
+```bash
+aula-hub gif play /path/to/animation.gif               # smart crop + vivid LED neon grading
+aula-hub gif play /path/to/animation.gif --mode crop   # strict 1:1 aspect crop, original colors
+aula-hub gif play /path/to/animation.gif --mode full   # full frame fitted to keyboard ratio
+aula-hub gif status                                    # show PID, RAM, FPS, and cached GIF
+aula-hub gif stop                                      # stop daemon and restore onboard RGB
+aula-hub gif resume                                    # resume last cached GIF
+aula-hub gif autostart on                              # start cached GIF automatically on login (systemd --user)
+```
+
 ## Update & Uninstall
 
 Update via the in-app updater or CLI:
@@ -73,6 +92,7 @@ Uninstall:
 - `dist-electron/iconWorker.mjs`: replaces `IconExtractor.exe` / PowerShell calls with direct base64 image reads on Linux (no `sharp` native build required).
 - `linux_renderer_shim.js`: defaults first launch to English, sends the WIN 68 HE / WIN 60 HE Host RGB Sync exit packet on WebHID connect, and dynamically translates Chinese toast/dialog messages when running in English.
 - `linux_updater.mjs`: resumable multi-stream / HTTP/1.1 Keep-Alive downloader (`Range: bytes=...`) supporting both `update:download(url, sha256)` and `latest.yml` SHA-512 flows, caching verified installers in `~/.cache/aula-hub-linux` with atomic `app/` swap via `apply_update.py`.
+- `linux_gif_daemon.mjs`: zero-dependency Node.js GIF89a decoder, WIN 68 HE / WIN 60 HE LED matrix mapper, and headless `/dev/hidraw` streaming daemon (`aula-gifd`) with auto-reconnect and optional `systemd --user` autostart.
 - `patch_notifications_en.mjs`: translates unobfuscated Element Plus / legacy frontend Chinese UI strings.
 
 ## Hardware Support

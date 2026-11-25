@@ -22,6 +22,7 @@ python3 -m py_compile "$ROOT_DIR/apply_update.py"
 node --check "$ROOT_DIR/linux_updater.mjs"
 node --check "$ROOT_DIR/linux_main_shim.mjs"
 node --check "$ROOT_DIR/linux_renderer_shim.js"
+node --check "$ROOT_DIR/linux_gif_daemon.mjs"
 node --check "$ROOT_DIR/patch_notifications_en.mjs"
 
 # Ensure no personal /home/<user> path or binary artifacts leaked into tracked files
@@ -389,7 +390,7 @@ echo "=== 4b. Obfuscated 1.3.9+ Patcher & Runtime Shim Tests ==="
 OBF_ROOT="$TMP_DIR/obf-root"
 OBF_APP="$OBF_ROOT/app.new"
 mkdir -p "$OBF_APP/dist-electron" "$OBF_APP/dist/assets"
-cp "$ROOT_DIR/linux_main_shim.mjs" "$ROOT_DIR/linux_renderer_shim.js" "$ROOT_DIR/linux_updater.mjs" "$OBF_ROOT/"
+cp "$ROOT_DIR/linux_main_shim.mjs" "$ROOT_DIR/linux_renderer_shim.js" "$ROOT_DIR/linux_updater.mjs" "$ROOT_DIR/linux_gif_daemon.mjs" "$OBF_ROOT/"
 cat > "$OBF_APP/dist-electron/iconWorker.mjs" <<'EOF'
 function _0x4209(a,b){return"";}console.log("obf-icon-worker");
 EOF
@@ -531,7 +532,7 @@ echo "=== 4c. 2.9.0+ CJS + V8 Bytecode Loader Patch Test ==="
 CJS_ROOT="$TMP_DIR/cjs-root"
 CJS_APP="$CJS_ROOT/app.new"
 mkdir -p "$CJS_APP/dist-electron" "$CJS_APP/dist/assets"
-cp "$ROOT_DIR/linux_main_shim.mjs" "$ROOT_DIR/linux_renderer_shim.js" "$ROOT_DIR/linux_updater.mjs" "$CJS_ROOT/"
+cp "$ROOT_DIR/linux_main_shim.mjs" "$ROOT_DIR/linux_renderer_shim.js" "$ROOT_DIR/linux_updater.mjs" "$ROOT_DIR/linux_gif_daemon.mjs" "$CJS_ROOT/"
 cat > "$CJS_APP/dist-electron/iconWorker.mjs" <<'EOF'
 console.log("orig-icon-worker");
 EOF
@@ -585,6 +586,7 @@ HOME="$FAKE_HOME" "$ROOT_DIR/install.sh" --prefix "$INST_PREFIX" --no-download -
 test -x "$INST_PREFIX/aula-hub"
 test -f "$INST_PREFIX/linux_main_shim.mjs"
 test -f "$INST_PREFIX/linux_renderer_shim.js"
+test -x "$INST_PREFIX/linux_gif_daemon.mjs"
 test -L "$FAKE_HOME/.local/bin/aula-hub"
 test -f "$FAKE_HOME/.local/share/applications/aula-hub.desktop"
 grep -q "Exec=$INST_PREFIX/aula-hub" "$FAKE_HOME/.local/share/applications/aula-hub.desktop"
@@ -594,6 +596,152 @@ test ! -e "$INST_PREFIX"
 test ! -L "$FAKE_HOME/.local/bin/aula-hub"
 test ! -f "$FAKE_HOME/.local/share/applications/aula-hub.desktop"
 echo "install.sh & uninstall.sh OK"
+
+echo "=== 5b. Lightweight GIF Daemon & Handoff Tests ==="
+GIF_TEST_DIR="$TMP_DIR/gif-test"
+mkdir -p "$GIF_TEST_DIR"
+python3 - <<PY
+# Generate a minimal valid 2-frame animated GIF89a (4x2, red -> cyan) without Pillow
+from pathlib import Path
+
+def make_test_gif(path: Path):
+    # Global color table: 0=black(0,0,0), 1=red(255,0,0), 2=cyan(0,255,255), 3=white(255,255,255)
+    gct = bytes([0,0,0, 255,0,0, 0,255,255, 255,255,255])
+    # LZW minCodeSize=2 (clear=4, eoi=5). 8 pixels all=1 -> codes: 4, 1, 1, 1, 1, 1, 1, 1, 1, 5
+    def lzw_encode_solid(val, count):
+        codes = [4] + [val] * count + [5]
+        bits = 0
+        nbits = 0
+        out = bytearray()
+        code_size = 3
+        next_code = 6
+        for idx, c in enumerate(codes):
+            bits |= (c << nbits)
+            nbits += code_size
+            while nbits >= 8:
+                out.append(bits & 0xff)
+                bits >>= 8
+                nbits -= 8
+            if idx >= 2 and idx < len(codes) - 1:
+                next_code += 1
+                if next_code == (1 << code_size) and code_size < 12:
+                    code_size += 1
+        if nbits > 0:
+            out.append(bits & 0xff)
+        return bytes([2, len(out)]) + bytes(out) + b"\x00"
+
+    buf = bytearray(b"GIF89a")
+    buf += (4).to_bytes(2, "little") + (2).to_bytes(2, "little")
+    buf += bytes([0x91, 0, 0])  # GCT flag=1, size=4 colors
+    buf += gct
+    for color_idx in (1, 2):
+        # Graphic Control Extension: delay=6 (60ms), disposal=2
+        buf += bytes([0x21, 0xf9, 0x04, 0x08, 0x06, 0x00, 0x00, 0x00])
+        # Image Descriptor: 4x2 at (0,0)
+        buf += bytes([0x2c, 0,0, 0,0, 4,0, 2,0, 0x00])
+        buf += lzw_encode_solid(color_idx, 8)
+    buf += b"\x3b"
+    path.write_bytes(buf)
+
+make_test_gif(Path("$GIF_TEST_DIR/sample.gif"))
+PY
+
+node --input-type=module - "$ROOT_DIR" "$GIF_TEST_DIR/sample.gif" <<'EOF'
+import fs from "node:fs";
+import path from "node:path";
+import vm from "node:vm";
+import { pathToFileURL } from "node:url";
+
+const rootDir = process.argv[2];
+const gifPath = process.argv[3];
+const mod = await import(pathToFileURL(path.join(rootDir, "linux_gif_daemon.mjs")).href);
+
+// 1. Report descriptor usage parser on real WIN 68 HE vendor interface descriptor
+const rdesc = Buffer.from("061bff0991a101850119002aff00150026ff007508953f8102190029ff9102c0", "hex");
+const usages = mod.parseReportDescriptorUsages(rdesc);
+if (!usages.some((u) => u.usagePage === 0xff1b && u.usage === 0x91)) {
+  throw new Error(`Expected 0xff1b:0x91 in usages, got ${JSON.stringify(usages)}`);
+}
+
+// 2. Pure-JS GIF89a decoder
+const decoded = mod.decodeGif(fs.readFileSync(gifPath));
+if (decoded.width !== 4 || decoded.height !== 2 || decoded.frames.length !== 2) {
+  throw new Error(`Unexpected GIF decode result: ${decoded.width}x${decoded.height}, frames=${decoded.frames.length}`);
+}
+if (decoded.frames[0].rgba[0] !== 255 || decoded.frames[0].rgba[1] !== 0) {
+  throw new Error("GIF frame 0 should be red");
+}
+if (decoded.frames[1].rgba[0] !== 0 || decoded.frames[1].rgba[1] !== 255 || decoded.frames[1].rgba[2] !== 255) {
+  throw new Error("GIF frame 1 should be cyan");
+}
+
+// 3. Compile GIF to RLW packets for both win68 & win60 across modes
+for (const layoutName of ["win68", "win60"]) {
+  for (const mode of ["led", "crop", "full"]) {
+    const cache = mod.compileGifToCache(gifPath, { layoutName, mode });
+    if (cache.frames.length !== 2 || cache.frames[0].length !== 8 || cache.frameDelayMs !== 60) {
+      throw new Error(`Invalid compiled cache for ${layoutName}/${mode}`);
+    }
+    const pkt0 = Buffer.from(cache.frames[0][0], "base64");
+    const syncOn = Buffer.from(cache.syncOn, "base64");
+    const syncOff = Buffer.from(cache.syncOff, "base64");
+    if (pkt0.length !== 63 || pkt0[0] !== 0x0f || pkt0[4] !== 54) {
+      throw new Error("Invalid RLW frame packet header");
+    }
+    if (syncOn[0] !== 0x17 || syncOn[5] !== 1 || syncOff[0] !== 0x17 || syncOff[5] !== 0) {
+      throw new Error("Invalid RLW sync packets");
+    }
+  }
+}
+
+// 4. Test linux_renderer_shim.js sendReport capture + cycle auto-locking
+const posted = [];
+class MockHID {
+  constructor() {
+    this.vendorId = 0x2e3c;
+    this.productId = 0xc365;
+    this.opened = true;
+    this.collections = [{ usagePage: 0xff1b, usage: 0x91 }];
+  }
+  async open() { return; }
+  async sendReport() { return; }
+}
+const ctx = vm.createContext({
+  window: {
+    localStorage: { getItem: () => null, setItem: () => {} },
+  },
+  HIDDevice: MockHID,
+  Uint8Array,
+  ArrayBuffer,
+  btoa: (s) => Buffer.from(s, "binary").toString("base64"),
+  setTimeout,
+  clearTimeout,
+  fetch: async (url, opts) => {
+    if (String(url).includes("/gif-handoff")) {
+      posted.push(JSON.parse(opts.body));
+    }
+    return { ok: true };
+  },
+});
+vm.runInContext(fs.readFileSync(path.join(rootDir, "linux_renderer_shim.js"), "utf8"), ctx);
+
+const dev = new MockHID();
+const cache = mod.compileGifToCache(gifPath, { layoutName: "win68", mode: "crop" });
+await dev.sendReport(1, Buffer.from(cache.syncOn, "base64"));
+// Stream 2 cycles of 2 frames (4 frames total) so cycle lock triggers at period=2
+for (let rep = 0; rep < 2; rep++) {
+  for (const framePkts of cache.frames) {
+    for (const b64 of framePkts) {
+      await dev.sendReport(1, Buffer.from(b64, "base64"));
+    }
+  }
+}
+const lastPost = posted[posted.length - 1];
+if (!lastPost || !lastPost.active || lastPost.frames.length !== 2) {
+  throw new Error(`Expected locked 2-frame handoff post, got: ${JSON.stringify(posted)}`);
+}
+console.log("Lightweight GIF daemon & renderer handoff tests OK");
+EOF
 
 echo "=== 6. udev Rules Validation ==="
 RULES_FILE="$ROOT_DIR/udev/99-aula-hub.rules"

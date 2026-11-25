@@ -45,6 +45,11 @@ BIN_LINK="$HOME/.local/bin/aula-hub"
 DESKTOP_FILE="$HOME/.local/share/applications/aula-hub.desktop"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/aula-hub"
 
+if [[ -f "$INSTALL_DIR/linux_gif_daemon.mjs" ]] && command -v node >/dev/null 2>&1; then
+  node "$INSTALL_DIR/linux_gif_daemon.mjs" stop >/dev/null 2>&1 || true
+  node "$INSTALL_DIR/linux_gif_daemon.mjs" autostart off >/dev/null 2>&1 || true
+fi
+
 if [[ -L "$BIN_LINK" || -f "$BIN_LINK" ]]; then
   rm -f "$BIN_LINK"
   echo "Removed $BIN_LINK"

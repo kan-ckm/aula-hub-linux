@@ -4,6 +4,10 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 export NODE_ENV=production
 
+if [[ "${1:-}" == "gif" ]]; then
+  exec node "$DIR/linux_gif_daemon.mjs" "${@:2}"
+fi
+
 find_electron() {
   if [[ -n "${AULA_HUB_ELECTRON:-}" ]] && command -v "$AULA_HUB_ELECTRON" >/dev/null 2>&1; then
     command -v "$AULA_HUB_ELECTRON"

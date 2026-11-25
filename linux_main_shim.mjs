@@ -9,6 +9,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { registerLinuxUpdater } from "./linux_updater.mjs";
+import {
+  saveGifCache,
+  startDaemonDetached,
+  stopDaemon,
+} from "./linux_gif_daemon.mjs";
 
 const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)));
 const RENDERER_SHIM_PATH = path.join(ROOT_DIR, "linux_renderer_shim.js");
@@ -209,6 +214,18 @@ export async function installLinuxMainShim() {
     process.title = "aula-hub";
   } catch {}
 
+  // Stop any running lightweight GIF daemon so AULA HUB has exclusive HID access
+  try {
+    stopDaemon({ signal: "SIGTERM", waitMs: 500 });
+  } catch {}
+
+  // Lightweight background GIF LED handoff state
+  let gifHandoffActive = false;
+  let gifHandoffCache = null;
+  let suppressGifHandoff = false;
+  let appIsQuitting = false;
+  let gifHandoffSpawned = false;
+
   const {
     app,
     BrowserWindow,
@@ -221,6 +238,27 @@ export async function installLinuxMainShim() {
     session,
     Tray,
   } = await import("electron");
+
+  const triggerGifHandoff = () => {
+    if (gifHandoffSpawned || suppressGifHandoff || !gifHandoffActive || !gifHandoffCache) {
+      return;
+    }
+    gifHandoffSpawned = true;
+    try {
+      saveGifCache(gifHandoffCache);
+      startDaemonDetached({ delayMs: 400 });
+    } catch {}
+  };
+
+  if (typeof app.on === "function") {
+    app.on("before-quit", () => {
+      appIsQuitting = true;
+    });
+    app.on("will-quit", () => {
+      appIsQuitting = true;
+      triggerGifHandoff();
+    });
+  }
 
   // 1. Safe wrapper for app.setLoginItemSettings (unsupported on Linux)
   if (typeof app.setLoginItemSettings === "function") {
@@ -375,7 +413,29 @@ export async function installLinuxMainShim() {
   // 5. Main-process UI English translation (Menu, Tray, Dialog, Notification, Notice popup)
   if (typeof Menu.buildFromTemplate === "function") {
     const origBuildMenu = Menu.buildFromTemplate.bind(Menu);
-    Menu.buildFromTemplate = (template) => origBuildMenu(translateMenuTemplate(template));
+    Menu.buildFromTemplate = (template) => {
+      const translated = translateMenuTemplate(template);
+      if (
+        Array.isArray(translated) &&
+        translated.some((it) => it && typeof it.label === "string" && /^Exit$/i.test(it.label.trim())) &&
+        !translated.some((it) => it && it.id === "__aula_exit_stop_gif__")
+      ) {
+        const next = translated.slice();
+        next.push({
+          id: "__aula_exit_stop_gif__",
+          label: "Exit & Stop GIF LED",
+          click: () => {
+            suppressGifHandoff = true;
+            try {
+              stopDaemon({ signal: "SIGTERM", waitMs: 400 });
+            } catch {}
+            app.quit();
+          },
+        });
+        return origBuildMenu(next);
+      }
+      return origBuildMenu(translated);
+    };
   }
 
   if (Tray?.prototype && typeof Tray.prototype.setToolTip === "function") {
@@ -451,6 +511,34 @@ export async function installLinuxMainShim() {
             return new Response(js, {
               status: 200,
               headers: { "Content-Type": "application/javascript; charset=utf-8" },
+            });
+          }
+          if (
+            parsed.hostname === "__linux_shim__" &&
+            parsed.pathname === "/gif-handoff"
+          ) {
+            try {
+              const payload = await request.json();
+              if (payload && payload.active === false) {
+                if (!appIsQuitting) {
+                  gifHandoffActive = false;
+                }
+              } else if (
+                payload &&
+                payload.active === true &&
+                Array.isArray(payload.frames) &&
+                payload.frames.length > 0
+              ) {
+                gifHandoffActive = true;
+                gifHandoffCache = payload;
+                try {
+                  saveGifCache(payload);
+                } catch {}
+              }
+            } catch {}
+            return new Response("ok", {
+              status: 200,
+              headers: { "Content-Type": "text/plain" },
             });
           }
         } catch {}

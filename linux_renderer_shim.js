@@ -28,6 +28,211 @@
   } catch {}
 
   // 2. WIN 68 HE / WIN 60 HE (RuiLianWei 0x2e3c:0xc365) Host RGB Sync exit packet on connect
+  //    + passive Live GIF HID capture for automatic lightweight daemon handoff on quit
+  function isRlwHidDevice(dev) {
+    return Boolean(
+      dev &&
+        dev.vendorId === 0x2e3c &&
+        dev.productId === 0xc365 &&
+        (!Array.isArray(dev.collections) ||
+          dev.collections.length === 0 ||
+          dev.collections.some((c) => c && c.usagePage === 0xff1b && c.usage === 0x91))
+    );
+  }
+
+  function bytesToBase64(u8) {
+    let bin = "";
+    for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]);
+    return typeof btoa === "function" ? btoa(bin) : "";
+  }
+
+  function postGifHandoff(payload) {
+    try {
+      if (typeof fetch !== "function") return;
+      fetch("aula://__linux_shim__/gif-handoff", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        keepalive: true,
+      }).catch(() => {});
+    } catch {}
+  }
+
+  const gifCap = {
+    active: false,
+    locked: false,
+    syncOnB64: "",
+    syncOffB64: "",
+    chunks: new Array(8),
+    chunkMask: 0,
+    frames: [],
+    delays: [],
+    lastFrameTs: 0,
+    lastPostTs: 0,
+    verifyIdx: 0,
+    stopTimer: null,
+  };
+
+  function resetGifCapture(syncOnBytes) {
+    if (gifCap.stopTimer) {
+      clearTimeout(gifCap.stopTimer);
+      gifCap.stopTimer = null;
+    }
+    gifCap.active = true;
+    gifCap.locked = false;
+    gifCap.syncOnB64 = bytesToBase64(syncOnBytes);
+    const off = new Uint8Array(63);
+    off[0] = 0x17;
+    off[4] = 0x02;
+    gifCap.syncOffB64 = bytesToBase64(off);
+    gifCap.chunks = new Array(8);
+    gifCap.chunkMask = 0;
+    gifCap.frames = [];
+    gifCap.delays = [];
+    gifCap.lastFrameTs = 0;
+    gifCap.lastPostTs = Date.now();
+    gifCap.verifyIdx = 0;
+  }
+
+  function computeMedianDelay(delays) {
+    if (!delays.length) return 60;
+    const sorted = delays.slice().sort((a, b) => a - b);
+    const mid = sorted[Math.floor(sorted.length / 2)];
+    return Math.max(16, Math.round(mid));
+  }
+
+  function detectCyclePeriod(frames) {
+    const n = frames.length;
+    if (n >= 3 && frames[n - 1].fp === frames[n - 2].fp && frames[n - 2].fp === frames[n - 3].fp) {
+      return 1;
+    }
+    const maxP = Math.floor(n / 2);
+    for (let p = 2; p <= maxP; p++) {
+      const checkLen = Math.min(p, 3);
+      if (n < p + checkLen) continue;
+      let match = true;
+      for (let k = 0; k < checkLen; k++) {
+        if (frames[n - 1 - k].fp !== frames[n - 1 - p - k].fp) {
+          match = false;
+          break;
+        }
+      }
+      if (match) return p;
+    }
+    return 0;
+  }
+
+  function pushGifSnapshot(frameList) {
+    if (!frameList.length || !gifCap.syncOnB64) return;
+    postGifHandoff({
+      active: true,
+      version: 1,
+      protocol: "rlw-matrix-132",
+      vid: 0x2e3c,
+      pid: 0xc365,
+      usagePage: 0xff1b,
+      usage: 0x91,
+      reportId: 1,
+      packetSize: 63,
+      chunkDelayMs: 2,
+      frameDelayMs: computeMedianDelay(gifCap.delays),
+      syncOn: gifCap.syncOnB64,
+      syncOff: gifCap.syncOffB64,
+      frames: frameList.map((f) => f.pkts),
+      source: "aula-hub",
+      updatedAt: Date.now(),
+    });
+  }
+
+  function observeRlwSendReport(dev, reportId, data) {
+    if (reportId !== 1 || !isRlwHidDevice(dev)) return;
+    let bytes;
+    if (data instanceof Uint8Array) {
+      bytes = data;
+    } else if (ArrayBuffer.isView(data)) {
+      bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    } else if (data instanceof ArrayBuffer) {
+      bytes = new Uint8Array(data);
+    } else {
+      return;
+    }
+    if (bytes.length < 7) return;
+
+    const cmd = bytes[0];
+    if (cmd === 0x17 && bytes[4] === 0x02) {
+      if (bytes[5] === 0x01 && bytes[6] === 0x01) {
+        resetGifCapture(bytes.length === 63 ? bytes : bytes.slice(0, 63));
+      } else if (bytes[5] === 0x00 && bytes[6] === 0x00) {
+        if (gifCap.stopTimer) clearTimeout(gifCap.stopTimer);
+        gifCap.stopTimer = setTimeout(() => {
+          gifCap.stopTimer = null;
+          gifCap.active = false;
+          gifCap.locked = false;
+          postGifHandoff({ active: false });
+        }, 300);
+      }
+      return;
+    }
+
+    if (cmd === 0x0f && gifCap.active) {
+      const chunk = (bytes[2] << 8) | bytes[3];
+      if (chunk < 0 || chunk >= 8) return;
+      const pktCopy = new Uint8Array(63);
+      pktCopy.set(bytes.subarray(0, Math.min(63, bytes.length)));
+      gifCap.chunks[chunk] = bytesToBase64(pktCopy);
+      gifCap.chunkMask |= 1 << chunk;
+
+      if (chunk === 7 && gifCap.chunkMask === 0xff) {
+        const now = Date.now();
+        if (gifCap.lastFrameTs > 0) {
+          const dt = now - gifCap.lastFrameTs - 16; // subtract 8 * 2ms chunk spacing
+          if (dt >= 5 && dt <= 5000) {
+            gifCap.delays.push(dt);
+            if (gifCap.delays.length > 30) gifCap.delays.shift();
+          }
+        }
+        gifCap.lastFrameTs = now;
+
+        const pkts = gifCap.chunks.slice();
+        const fp = pkts.join("|");
+        gifCap.chunks = new Array(8);
+        gifCap.chunkMask = 0;
+
+        if (gifCap.locked) {
+          const expected = gifCap.frames[gifCap.verifyIdx % gifCap.frames.length];
+          if (expected && expected.fp === fp) {
+            gifCap.verifyIdx++;
+            return;
+          }
+          // Animation changed without a new syncOn: re-capture
+          gifCap.locked = false;
+          gifCap.frames = [{ fp, pkts }];
+          gifCap.verifyIdx = 0;
+          return;
+        }
+
+        gifCap.frames.push({ fp, pkts });
+        if (gifCap.frames.length > 240) {
+          gifCap.locked = true;
+          pushGifSnapshot(gifCap.frames);
+          return;
+        }
+
+        const period = detectCyclePeriod(gifCap.frames);
+        if (period > 0) {
+          const cycle = gifCap.frames.slice(0, period);
+          gifCap.frames = cycle;
+          gifCap.locked = true;
+          gifCap.verifyIdx = gifCap.frames.length % period;
+          pushGifSnapshot(cycle);
+        } else if (now - gifCap.lastPostTs >= 1500) {
+          gifCap.lastPostTs = now;
+          pushGifSnapshot(gifCap.frames);
+        }
+      }
+    }
+  }
+
   try {
     if (
       typeof HIDDevice !== "undefined" &&
@@ -39,17 +244,7 @@
       const wrappedOpen = async function openWithRlwSyncOff() {
         const res = await origOpen.apply(this, arguments);
         try {
-          const isRlw =
-            this &&
-            this.opened &&
-            this.vendorId === 0x2e3c &&
-            this.productId === 0xc365 &&
-            (!Array.isArray(this.collections) ||
-              this.collections.length === 0 ||
-              this.collections.some(
-                (c) => c && c.usagePage === 0xff1b && c.usage === 0x91
-              ));
-          if (isRlw && typeof this.sendReport === "function") {
+          if (this && this.opened && isRlwHidDevice(this) && typeof this.sendReport === "function") {
             const syncOff = new Uint8Array(63);
             syncOff[0] = 23;
             syncOff[4] = 2;
@@ -60,6 +255,23 @@
       };
       wrappedOpen.__aulaRlwWrapped = true;
       HIDDevice.prototype.open = wrappedOpen;
+    }
+
+    if (
+      typeof HIDDevice !== "undefined" &&
+      HIDDevice.prototype &&
+      typeof HIDDevice.prototype.sendReport === "function" &&
+      !HIDDevice.prototype.sendReport.__aulaGifWrapped
+    ) {
+      const origSendReport = HIDDevice.prototype.sendReport;
+      const wrappedSendReport = function sendReportWithGifCapture(reportId, data) {
+        try {
+          observeRlwSendReport(this, reportId, data);
+        } catch {}
+        return origSendReport.apply(this, arguments);
+      };
+      wrappedSendReport.__aulaGifWrapped = true;
+      HIDDevice.prototype.sendReport = wrappedSendReport;
     }
   } catch {}
 

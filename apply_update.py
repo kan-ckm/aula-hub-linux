@@ -534,6 +534,7 @@ def extract_and_build(source: Path, target_root: Path, install_sharp: bool = Fal
             "linux_updater.mjs",
             "linux_main_shim.mjs",
             "linux_renderer_shim.js",
+            "linux_gif_daemon.mjs",
             "patch_notifications_en.mjs",
         ):
             src_f = ROOT_DIR / fname

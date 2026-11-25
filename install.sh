@@ -146,7 +146,7 @@ fi
 echo "Installing AULA HUB wrapper to: $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR/udev"
 
-for f in aula-hub apply_update.py linux_updater.mjs linux_main_shim.mjs linux_renderer_shim.js patch_notifications_en.mjs uninstall.sh; do
+for f in aula-hub apply_update.py linux_updater.mjs linux_main_shim.mjs linux_renderer_shim.js linux_gif_daemon.mjs patch_notifications_en.mjs uninstall.sh; do
   if [[ -f "$SOURCE_DIR/$f" ]]; then
     cp -f "$SOURCE_DIR/$f" "$INSTALL_DIR/$f"
   fi
@@ -155,7 +155,7 @@ if [[ -f "$SOURCE_DIR/udev/99-aula-hub.rules" ]]; then
   cp -f "$SOURCE_DIR/udev/99-aula-hub.rules" "$INSTALL_DIR/udev/99-aula-hub.rules"
 fi
 
-chmod +x "$INSTALL_DIR/aula-hub" "$INSTALL_DIR/apply_update.py" "$INSTALL_DIR/uninstall.sh"
+chmod +x "$INSTALL_DIR/aula-hub" "$INSTALL_DIR/apply_update.py" "$INSTALL_DIR/linux_gif_daemon.mjs" "$INSTALL_DIR/uninstall.sh"
 
 if [[ "$NO_DOWNLOAD" -eq 0 ]]; then
   if [[ -n "$INSTALLER_PATH" ]]; then
